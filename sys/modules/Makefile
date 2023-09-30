@@ -419,6 +419,7 @@ SUBDIR=	\
 	${_vmm} \
 	${_vmware} \
 	vr \
+	vsock \
 	vte \
 	${_wbwd} \
 	${_wdatwd} \
