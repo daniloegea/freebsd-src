@@ -22,6 +22,11 @@
 # SUCH DAMAGE.
 #
 
-SUBDIR=	virtio pci network block balloon scsi random console p9fs socket
+.PATH: ${SRCTOP}/sys/dev/virtio/socket
 
-.include <bsd.subdir.mk>
+KMOD=	virtio_socket
+SRCS=	virtio_socket.c
+SRCS+=	virtio_bus_if.h virtio_if.h
+SRCS+=	bus_if.h device_if.h
+
+.include <bsd.kmod.mk>
