@@ -40,6 +40,7 @@
 #include <sys/sysctl.h>
 #include <sys/taskqueue.h>
 #include <sys/queue.h>
+#include <sys/sdt.h>
 
 #include <sys/domain.h>
 #include <sys/protosw.h>
@@ -61,6 +62,8 @@
 #include <machine/bus.h>
 #include <machine/resource.h>
 #include <sys/bus.h>
+
+#include <net/vsock.h>
 
 #include <dev/virtio/virtio.h>
 #include <dev/virtio/virtqueue.h>
@@ -104,9 +107,7 @@ struct virtio_vsock_packet {
 #define VTSOCK_UNLOCK(_sc)	mtx_unlock(&(_sc)->vtsock_mtx)
 #define VTSOCK_RXQ_LOCK(_sc)	mtx_lock(&(_sc)->vtsock_rxq_mtx)
 #define VTSOCK_RXQ_UNLOCK(_sc)	mtx_unlock(&(_sc)->vtsock_rxq_mtx)
-static struct vtsock_softc	*vsock_softc = NULL;
-
-static _Atomic(uint32_t) vtsock_last_source_port = 123456;
+static struct vtsock_softc	*vtsock_softc = NULL;
 
 #define so2vsockpcb(so) \
 	((struct vsock_pcb *)((so)->so_pcb))
@@ -114,11 +115,6 @@ static _Atomic(uint32_t) vtsock_last_source_port = 123456;
 	((struct socket *)((vsockpcb)->so))
 
 MALLOC_DEFINE(M_VSOCK, "virtio_socket", "virtio socket control structures");
-
-static struct mtx vsock_pcbs_mtx;
-static LIST_HEAD(, vsock_pcb)	vsock_pcbs;
-static struct mtx vsock_bound_pcbs_mtx;
-static LIST_HEAD(, vsock_pcb)	vsock_bound_pcbs;
 
 static int	vtsock_probe(device_t);
 static int	vtsock_attach(device_t);
@@ -134,7 +130,9 @@ static void	vtsock_rx_intr_handler(void *);
 static uint64_t	vtsock_get_local_cid(void);
 static int	vtsock_populate_rxvq(struct vtsock_softc *sc);
 
-static int	vtsock_send(struct socket *so, struct uio *uio);
+static int 	vtsock_connect(struct socket *);
+static int	vtsock_disconnect(struct socket *);
+static int	vtsock_send(struct socket *so, struct mbuf *m);
 static int	vtsock_send_reply_reset(struct virtio_vsock_hdr *hdr);
 static int	vtsock_send_request_response(struct vsock_pcb *pcb);
 static int	vtsock_send_credit_update(struct socket *so);
@@ -143,9 +141,9 @@ static void	vtsock_setup_sysctl(struct vtsock_softc *sc);
 static int	vtsock_setup_taskqueue(struct vtsock_softc *sc);
 static void	vtsock_rxq_tq_deffered(void *xtxq, int pending __unused);
 
-static void	vsock_pcb_insert(struct vsock_pcb *pcb, int list);
-static void	vsock_pcb_remove(struct vsock_pcb *pcb, int list);
-static struct vsock_pcb *	vsock_pcb_lookup(uint32_t src_port, uint32_t dst_port, int list);
+static uint16_t	_vtsock_get_type(struct vsock_pcb *pcb);
+static void	_vtsock_populate_header(struct virtio_vsock_hdr *hdr, uint16_t op, struct vsock_pcb *pcb);
+static int	_vtsock_can_send_more(void);
 
 /* VSOCK Transport layer */
 
@@ -185,6 +183,12 @@ static driver_t vtsock_driver = {
 	sizeof(struct vtsock_softc)
 };
 
+static struct virtio_transport_ops transport = {
+	.get_local_cid = vtsock_get_local_cid,
+	.connect = vtsock_connect,
+	.disconnect = vtsock_disconnect,
+	.send = vtsock_send,
+};
 
 VIRTIO_SIMPLE_PNPINFO(virtio_socket, VIRTIO_ID_VSOCK,
     "VirtIO VSOCK Transport Adapter");
@@ -218,6 +222,7 @@ vtsock_modevent(module_t mod, int type, void *unused)
 VIRTIO_DRIVER_MODULE(virtio_socket, vtsock_driver, vtsock_modevent, NULL);
 MODULE_VERSION(virtio_socket, 1);
 MODULE_DEPEND(virtio_socket, virtio, 1, 1, 1);
+MODULE_DEPEND(virtio_socket, vsock, 1, 1, 1);
 
 static int
 vtsock_probe(device_t dev)
@@ -270,7 +275,7 @@ vtsock_attach(device_t dev)
 	int error;
 
 	sc = device_get_softc(dev);
-	vsock_softc = sc;
+	vtsock_softc = sc;
 	sc->vtsock_dev = dev;
 
 	virtio_set_feature_desc(dev, vtsock_feature_desc);
@@ -323,6 +328,9 @@ vtsock_attach(device_t dev)
 		goto fail;
 	}
 
+
+	vsock_transport_register(&transport);
+
 fail:
 	if (error)
 		vtsock_detach(dev);
@@ -360,6 +368,8 @@ vtsock_detach(device_t dev)
 
 	mtx_destroy(&sc->vtsock_mtx);
 
+	vsock_transport_deregister();
+
 	return (0);
 }
 
@@ -376,18 +386,12 @@ vtsock_read_config(struct vtsock_softc *sc, struct virtio_vsock_config *sockcfg)
 
 static uint64_t
 vtsock_get_local_cid(void) {
-	return vsock_softc->vtsock_config.guest_cid;
+	return vtsock_softc->vtsock_config.guest_cid;
 }
 
 static int
 vtsock_config_change(device_t dev)
 {
-	struct vtsock_softc *sc;
-
-	sc = device_get_softc(dev);
-
-	printf("Config change %p\n", sc->vtsock_dev);
-
 	return (0);
 }
 
@@ -470,7 +474,7 @@ vtsock_output(void *buf, int bufsize)
 {
 	struct sglist_seg segs[2];
 	struct sglist sg;
-	struct virtqueue *vq = vsock_softc->vtsock_txvq;
+	struct virtqueue *vq = vtsock_softc->vtsock_txvq;
 	int error;
 
 	sglist_init(&sg, 2, segs);
@@ -485,26 +489,38 @@ vtsock_output(void *buf, int bufsize)
 	}
 }
 
-static void
-vtsock_connect(struct socket *so, struct sockaddr_vm *vsock)
+static int
+vtsock_connect(struct socket *so)
 {
 	struct vsock_pcb *pcb = so2vsockpcb(so);
 
 	struct virtio_vsock_hdr *new_hdr = malloc(VTSOCK_BUFSZ, M_VSOCK, M_NOWAIT | M_ZERO);
-	new_hdr->src_port =	vtsock_last_source_port++;
-	new_hdr->dst_port =	vsock->svm_port;
-	new_hdr->dst_cid =	vsock->svm_cid;
-	new_hdr->src_cid =	vsock_softc->vtsock_config.guest_cid;
-	new_hdr->op =		VIRTIO_VSOCK_OP_REQUEST;
-	new_hdr->type =		VIRTIO_VSOCK_TYPE_STREAM;
-	new_hdr->buf_alloc =	sbspace(&so->so_rcv);
 
-	pcb->local_addr.svm_port = new_hdr->src_port;
-	pcb->local_addr.svm_cid = vsock_softc->vtsock_config.guest_cid;
-	pcb->remote_addr.svm_port = vsock->svm_port;
-	pcb->remote_addr.svm_cid = vsock->svm_cid;
+	_vtsock_populate_header(new_hdr, VIRTIO_VSOCK_OP_REQUEST, pcb);
+	new_hdr->buf_alloc = sbspace(&so->so_rcv);
 
 	vtsock_output((void *) new_hdr, VTSOCK_BUFSZ);
+
+	free(new_hdr, M_VSOCK);
+
+	return 0;
+}
+
+static int
+vtsock_disconnect(struct socket *so)
+{
+	struct vsock_pcb *pcb = so2vsockpcb(so);
+
+	struct virtio_vsock_hdr *new_hdr = malloc(VTSOCK_BUFSZ, M_VSOCK, M_NOWAIT | M_ZERO);
+
+	_vtsock_populate_header(new_hdr, VIRTIO_VSOCK_OP_SHUTDOWN, pcb);
+	new_hdr->flags = 3;
+
+	vtsock_output((void *) new_hdr, VTSOCK_BUFSZ);
+
+	free(new_hdr, M_VSOCK);
+
+	return 0;
 }
 
 static int
@@ -520,12 +536,8 @@ vtsock_send_credit_update(struct socket *so)
 
 	struct virtio_vsock_hdr *new_hdr = (struct virtio_vsock_hdr *) buf;
 
-	new_hdr->src_port = pcb->local_addr.svm_port;
-	new_hdr->dst_port = pcb->remote_addr.svm_port;
-	new_hdr->dst_cid = pcb->remote_addr.svm_cid;
-	new_hdr->src_cid = pcb->local_addr.svm_cid;
-	new_hdr->op = VIRTIO_VSOCK_OP_CREDIT_UPDATE;
-	new_hdr->type = VIRTIO_VSOCK_TYPE_STREAM;
+	_vtsock_populate_header(new_hdr, VIRTIO_VSOCK_OP_CREDIT_UPDATE, pcb);
+
 	SOCKBUF_LOCK(&so->so_snd);
 	new_hdr->buf_alloc = sbspace(&so->so_rcv);
 	SOCKBUF_UNLOCK(&so->so_snd);
@@ -534,50 +546,56 @@ vtsock_send_credit_update(struct socket *so)
 
 	vtsock_output(buf, VTSOCK_BUFSZ);
 
+	free(buf, M_VSOCK);
+
 	return 0;
 }
 
-
 static int
-vtsock_send(struct socket *so, struct uio *uio)
+vtsock_send(struct socket *so, struct mbuf *m)
 {
 	int total = 0;
+
+	struct virtio_vsock_hdr *new_hdr;
 	struct vsock_pcb *pcb = so2vsockpcb(so);
 	size_t hdr_len = sizeof(struct virtio_vsock_hdr);
+	char *buf, *data;
+	int sndlen;
 
-	while (uio->uio_resid > 0) {
-		char *buf = malloc(VTSOCK_BUFSZ, M_VSOCK, M_NOWAIT | M_ZERO);
-		if (buf == NULL) {
-			printf("Can't allocate buf so_send\n");
-			return -1;
-		}
+	if (!_vtsock_can_send_more())
+		return -ENOBUFS;
 
-		struct virtio_vsock_hdr *new_hdr = (struct virtio_vsock_hdr *) buf;
-
-		new_hdr->src_port = pcb->local_addr.svm_port;
-		new_hdr->dst_port = pcb->remote_addr.svm_port;
-		new_hdr->dst_cid = pcb->remote_addr.svm_cid;
-		new_hdr->src_cid = pcb->local_addr.svm_cid;
-		new_hdr->op = VIRTIO_VSOCK_OP_RW;
-		new_hdr->type = VIRTIO_VSOCK_TYPE_STREAM;
-		SOCKBUF_LOCK(&so->so_snd);
-		new_hdr->buf_alloc = sbspace(&so->so_rcv);
-		SOCKBUF_UNLOCK(&so->so_snd);
-		new_hdr->fwd_cnt = pcb->fwd_cnt;
-		new_hdr->len = MIN(uio->uio_resid, VTSOCK_BUFSZ - hdr_len);
-
-		char *data = buf + sizeof(struct virtio_vsock_hdr);
-		uiomove(data, MIN(uio->uio_resid, VTSOCK_BUFSZ - hdr_len), uio);
-		total += new_hdr->len;
-
-		pcb->tx_cnt += new_hdr->len;
-		pcb->peer_credit -= new_hdr->len;
-
-		printf("peer credit: %u\n", pcb->peer_credit);
-
-		vtsock_output(buf, VTSOCK_BUFSZ);
-		// buf can be freed here
+	buf = malloc(VTSOCK_BUFSZ, M_VSOCK, M_NOWAIT | M_ZERO);
+	if (buf == NULL) {
+		printf("Can't allocate buf so_send\n");
+		return -ENOBUFS;
 	}
+
+	new_hdr = (struct virtio_vsock_hdr *) buf;
+
+	sndlen = MIN(m->m_len, VTSOCK_BUFSZ - hdr_len);
+	_vtsock_populate_header(new_hdr, VIRTIO_VSOCK_OP_RW, pcb);
+
+	SOCKBUF_LOCK(&so->so_snd);
+	new_hdr->buf_alloc = sbspace(&so->so_rcv);
+	SOCKBUF_UNLOCK(&so->so_snd);
+	new_hdr->fwd_cnt = pcb->fwd_cnt;
+	new_hdr->len = sndlen;
+
+	data = buf + sizeof(struct virtio_vsock_hdr);
+	m_copydata(m, 0, sndlen, data);
+	m_adj(m, sndlen);
+	total += sndlen;
+
+	// TODO: check if there is more than a single mbuf of data to be sent
+	m_free(m);
+
+	pcb->tx_cnt += new_hdr->len;
+	pcb->peer_credit -= new_hdr->len;
+
+	vtsock_output(buf, VTSOCK_BUFSZ);
+
+	free(buf, M_VSOCK);
 
 	return total;
 }
@@ -594,104 +612,170 @@ vtsock_rx_intr_handler(void *ctx) {
 }
 
 static void
-vtsock_operation_handler(void *buf, size_t len)
+_vtsock_handle_op_response(struct virtio_vsock_hdr *hdr)
+{
+	struct vsock_pcb *pcb = NULL;
+
+	pcb = vsock_pcb_lookup_connected(hdr->dst_port, hdr->src_port);
+
+	if (!pcb) {
+		return;
+	}
+
+	printf("Found the PCB. Connection response.\n");
+
+	if (pcb->so->so_state & SS_ISCONNECTING) {
+		printf("Socket was ISCONNECTING. Setting to ISCONNECTED\n");
+		soisconnected(pcb->so);
+		pcb->peer_credit = hdr->buf_alloc;
+	}
+}
+
+static void
+_vtsock_handle_op_rw(struct virtio_vsock_hdr *hdr, void *buf, size_t len)
+{
+	struct vsock_pcb *pcb = NULL;
+	struct socket *so;
+
+	pcb = vsock_pcb_lookup_connected(hdr->dst_port, hdr->src_port);
+
+	if (!pcb) {
+		return;
+	}
+
+	printf("Found the PCB. Data received.\n");
+
+	so = vsockpcb2so(pcb);
+	if ((so->so_state & SS_ISCONNECTED) == 0) {
+		vtsock_send_reply_reset(hdr);
+		return;
+	}
+
+	if (hdr->len <= 0) {
+		return;
+	}
+
+	struct mbuf *m = m_get(M_NOWAIT, MT_DATA);
+	if (!m_append(m, len - sizeof(*hdr), (char*)buf + sizeof(*hdr))) {
+		printf("m_append failed god knows why...\n");
+	}
+	SOCKBUF_LOCK(&so->so_rcv);
+	sbappendstream_locked(&so->so_rcv, m, 0);
+	pcb->fwd_cnt += len - sizeof(*hdr);
+	pcb->peer_credit = hdr->buf_alloc - (pcb->tx_cnt - hdr->fwd_cnt);
+
+	// WTF is this?
+	long buf_alloc = sbspace(&so->so_rcv);
+	if (buf_alloc - (pcb->fwd_cnt % buf_alloc) < VTSOCK_BUFSZ * 2)
+		vtsock_send_credit_update(so);
+
+	sorwakeup_locked(so);
+}
+
+static void
+_vtsock_handle_op_reset(struct virtio_vsock_hdr *hdr)
 {
 	struct vsock_pcb *pcb;
 	struct socket *so;
+
+	pcb = vsock_pcb_lookup_connected(hdr->dst_port, hdr->src_port);
+	if (!pcb) {
+		printf("Can't find disconnecting PCB\n");
+		return;
+	}
+
+	so = vsockpcb2so(pcb);
+	if (so->so_state & SS_ISDISCONNECTING) {
+		printf("Socket is disconnecting, finishing\n");
+		soisdisconnected(so);
+	} else if (so->so_state & SS_ISCONNECTING) {
+		printf("Connection refused\n");
+		so->so_error = ECONNREFUSED;
+		soisdisconnected(so);
+	}
+}
+
+static void
+_vtsock_handle_op_request(struct virtio_vsock_hdr *hdr)
+{
+	struct vsock_pcb *pcb;
+	struct socket *so;
+	struct socket *new_socket;
+	struct vsock_pcb *new_pcb;
+
+	pcb = vsock_pcb_lookup_bound(hdr->dst_port, 0);
+
+	if (!pcb || !SOLISTENING(pcb->so)) {
+		vtsock_send_reply_reset(hdr);
+		return;
+	}
+
+	printf("Found the PCB. Connection request.\n");
+
+	so = pcb->so;
+
+	CURVNET_SET(so->so_vnet);
+	new_socket = sonewconn(so, 0);
+	CURVNET_RESTORE();
+	new_pcb = new_socket->so_pcb;
+	new_pcb->local_addr.svm_port = pcb->local_addr.svm_port;
+	new_pcb->local_addr.svm_cid = pcb->local_addr.svm_cid;
+	new_pcb->remote_addr.svm_port = hdr->src_port;
+	new_pcb->remote_addr.svm_cid = hdr->src_cid;
+	new_pcb->fwd_cnt = 0;
+	new_pcb->tx_cnt = 0;
+	new_pcb->peer_credit = hdr->buf_alloc;
+
+	vsock_pcb_insert_connected(new_pcb);
+	soisconnected(new_socket);
+	vtsock_send_request_response(new_pcb);
+}
+
+static void
+_vtsock_handle_op_credit_request(struct virtio_vsock_hdr *hdr)
+{
+	struct vsock_pcb *pcb;
+	struct socket *so;
+
+	pcb = vsock_pcb_lookup_connected(hdr->dst_port, hdr->src_port);
+
+	if (!pcb) {
+		return;
+	}
+
+	so = vsockpcb2so(pcb);
+	if ((so->so_state & SS_ISCONNECTED) == 0) {
+		vtsock_send_reply_reset(hdr);
+		return;
+	}
+
+	printf("Found the PCB. Credit request received.\n");
+
+	vtsock_send_credit_update(so);
+}
+
+static void
+vtsock_operation_handler(void *buf, size_t len)
+{
 	struct virtio_vsock_hdr *hdr = buf;
 
-	if (hdr->op == VIRTIO_VSOCK_OP_RESPONSE) {
-		if ((pcb = vsock_pcb_lookup(hdr->dst_port, hdr->src_port, VSOCK_CONNECTED_LIST))) {
-			printf("Found the PCB. Connection response.\n");
-			if (pcb->so->so_state & SS_ISCONNECTING) {
-				printf("Socket was ISCONNECTING. Setting to ISCONNECTED\n");
-				soisconnected(pcb->so);
-
-				pcb->peer_credit = hdr->buf_alloc;
-			}
-		}
-	} else if (hdr->op == VIRTIO_VSOCK_OP_RW) {
-		if ((pcb = vsock_pcb_lookup(hdr->dst_port, hdr->src_port, VSOCK_CONNECTED_LIST))) {
-			so = vsockpcb2so(pcb);
-			printf("Found the PCB. Data received.\n");
-			if ((so->so_state & SS_ISCONNECTED) == 0) {
-				vtsock_send_reply_reset(hdr);
-				return;
-			}
-			if (hdr->len > 0) {
-				struct mbuf *m = m_get(M_NOWAIT, MT_DATA);
-				if (!m_append(m, len - sizeof(*hdr), (char*)buf + sizeof(*hdr))) {
-                                        printf("m_append failed god knows why...\n");
-                                }
-				SOCKBUF_LOCK(&so->so_rcv);
-				sbappendstream_locked(&so->so_rcv, m, 0);
-				pcb->fwd_cnt += len - sizeof(*hdr);
-				pcb->peer_credit = hdr->buf_alloc - (pcb->tx_cnt - hdr->fwd_cnt);
-
-				long buf_alloc = sbspace(&so->so_rcv);
-				if (buf_alloc - (pcb->fwd_cnt % buf_alloc) < VTSOCK_BUFSZ * 2)
-					vtsock_send_credit_update(so);
-
-				sorwakeup_locked(so);
-			}
-
-		}
-	} else if (hdr->op == VIRTIO_VSOCK_OP_RST) {
-		pcb = vsock_pcb_lookup(hdr->dst_port, hdr->src_port, VSOCK_CONNECTED_LIST);
-		if (pcb == NULL) {
-			printf("Can't find disconnecting PCB\n");
-			return;
-		}
-
-		so = vsockpcb2so(pcb);
-		if (so->so_state & SS_ISDISCONNECTING) {
-			printf("Socket is disconnecting, finishing\n");
-			soisdisconnected(so);
-		} else if (so->so_state & SS_ISCONNECTING) {
-			printf("Connection refused\n");
-			so->so_error = ECONNREFUSED;
-			soisdisconnected(so);
-		}
-	} else if (hdr->op == VIRTIO_VSOCK_OP_REQUEST) {
-		if ((pcb = vsock_pcb_lookup(hdr->dst_port, 0, VSOCK_BOUND_LIST))) {
-			printf("Found the PCB. Connection request.\n");
-			if (SOLISTENING(pcb->so)) {
-				struct socket *new_socket;
-				struct vsock_pcb *new_pcb;
-
-				so = pcb->so;
-
-				CURVNET_SET(so->so_vnet);
-				new_socket = sonewconn(so, 0);
-				CURVNET_RESTORE();
-				new_pcb = new_socket->so_pcb;
-				new_pcb->local_addr.svm_port = pcb->local_addr.svm_port;
-				new_pcb->local_addr.svm_cid = pcb->local_addr.svm_cid;
-				new_pcb->remote_addr.svm_port = hdr->src_port;
-				new_pcb->remote_addr.svm_cid = hdr->src_cid;
-				new_pcb->fwd_cnt = 0;
-				new_pcb->tx_cnt = 0;
-				new_pcb->peer_credit = hdr->buf_alloc;
-
-				vsock_pcb_insert(new_pcb, VSOCK_CONNECTED_LIST);
-				soisconnected(new_socket);
-				vtsock_send_request_response(new_pcb);
-			}
-		} else {
-			vtsock_send_reply_reset(hdr);
-		}
-	} else if (hdr->op == VIRTIO_VSOCK_OP_CREDIT_REQUEST) {
-		if ((pcb = vsock_pcb_lookup(hdr->dst_port, hdr->src_port, VSOCK_CONNECTED_LIST))) {
-			so = vsockpcb2so(pcb);
-			printf("Found the PCB. Credit request received.\n");
-			if ((so->so_state & SS_ISCONNECTED) == 0) {
-				vtsock_send_reply_reset(hdr);
-				return;
-			}
-			vtsock_send_credit_update(so);
-		}
-	} 
-
+	switch(hdr->op) {
+	case VIRTIO_VSOCK_OP_RESPONSE:
+		_vtsock_handle_op_response(hdr);
+		break;
+	case VIRTIO_VSOCK_OP_RW:
+		_vtsock_handle_op_rw(hdr, buf, len);
+		break;
+	case VIRTIO_VSOCK_OP_RST:
+		_vtsock_handle_op_reset(hdr);
+		break;
+	case VIRTIO_VSOCK_OP_REQUEST:
+		_vtsock_handle_op_request(hdr);
+		break;
+	case VIRTIO_VSOCK_OP_CREDIT_REQUEST:
+		_vtsock_handle_op_credit_request(hdr);
+		break;
+	}
 }
 
 static int
@@ -709,6 +793,8 @@ vtsock_send_reply_reset(struct virtio_vsock_hdr *hdr)
 
 	vtsock_output((void *) new_hdr, VTSOCK_BUFSZ);
 
+	free(new_hdr, M_VSOCK);
+
 	return (0);
 }
 
@@ -717,16 +803,13 @@ vtsock_send_request_response(struct vsock_pcb *pcb)
 {
 	struct virtio_vsock_hdr *new_hdr = malloc(VTSOCK_BUFSZ, M_VSOCK, M_NOWAIT | M_ZERO);
 
-	new_hdr->src_port = pcb->local_addr.svm_port;
-	new_hdr->src_cid = pcb->local_addr.svm_cid;
-	new_hdr->dst_port = pcb->remote_addr.svm_port;
-	new_hdr->dst_cid = pcb->remote_addr.svm_cid;
-	new_hdr->op = VIRTIO_VSOCK_OP_RESPONSE;
-	new_hdr->type = VIRTIO_VSOCK_TYPE_STREAM;
+	_vtsock_populate_header(new_hdr, VIRTIO_VSOCK_OP_RESPONSE, pcb);
 	new_hdr->flags = 0;
 	new_hdr->buf_alloc = sbspace(&pcb->so->so_rcv);
 
 	vtsock_output((void *) new_hdr, VTSOCK_BUFSZ);
+
+	free(new_hdr, M_VSOCK);
 
 	return (0);
 }
@@ -739,12 +822,15 @@ vtsock_rxq_tq_deffered(void *xtxq, int pending __unused) {
 	struct virtqueue *vq = sc->vtsock_rxvq;
 	uint32_t len = 0;
 	void *buf;
-	int deq = 0;
+	int deq;
 
         VTSOCK_RXQ_LOCK(sc);
+
+again:
+
+	deq = 0;
+
 	while ((buf = virtqueue_dequeue(vq, &len)) != NULL) {
-                DEBUG_VTSOCK_HEADER(((struct virtio_vsock_hdr *)buf));
-                printf("virtqueue_dequeue buf len: %u\n", len);
 		vtsock_operation_handler(buf, len);
 		vtsock_enqueue_rxvq_buf(vq, buf, VTSOCK_BUFSZ);
 		deq++;
@@ -756,7 +842,7 @@ vtsock_rxq_tq_deffered(void *xtxq, int pending __unused) {
 
 
 	if (virtqueue_enable_intr(vq) != 0) {
-                printf("virtqueue_enable_intr returned != 0 o.O\n");
+                goto again;
         }
 
         VTSOCK_RXQ_UNLOCK(sc);
@@ -781,348 +867,28 @@ vtsock_setup_sysctl(struct vtsock_softc *sc)
 			"Guest context ID");
 }
 
+static uint16_t
+_vtsock_get_type(struct vsock_pcb *pcb)
+{
+	if (pcb->so->so_proto->pr_type == SOCK_STREAM)
+		return VIRTIO_VSOCK_TYPE_STREAM;
 
-/*
- * VSOCK Transport sockets
- */
+	return 0;
+}
 
-SYSCTL_NODE(_net, OID_AUTO, vsock, CTLFLAG_RD, 0, "Virtio VSOCK");
-static int vsock_dom_probe(void);
-
-static struct protosw vsock_protosw = {
-	.pr_type =		SOCK_STREAM,
-	.pr_protocol =		VIRTIO_VSOCK_F_STREAM,
-	.pr_flags =		PR_CONNREQUIRED,
-	.pr_attach =		vsock_attach,
-	.pr_bind =		vsock_bind,
-	.pr_listen =		vsock_listen,
-	.pr_accept =		vsock_accept,
-	.pr_connect =		vsock_connect,
-	.pr_peeraddr =		vsock_peeraddr,
-	.pr_sockaddr =		vsock_sockaddr,
-	.pr_soreceive =		soreceive_generic,
-	.pr_sopoll =		sopoll_generic,
-	.pr_sosend =		vsock_sosend,
-	.pr_disconnect =	vsock_disconnect,
-	.pr_close =		vsock_close,
-	.pr_detach =		vsock_detach,
-	.pr_shutdown =		vsock_shutdown,
-	.pr_abort =		vsock_abort,
-};
-
-static struct domain vsock_domain = {
-	.dom_family =	AF_VSOCK,
-	.dom_name =	"vsock",
-	.dom_flags =   	DOMF_UNLOADABLE,
-	.dom_probe =	vsock_dom_probe,
-	.dom_nprotosw =	1,
-	.dom_protosw =	{ &vsock_protosw },
-};
-
-DOMAIN_SET(vsock_);
-
-#define MAX_PORT	((uint32_t)0xFFFFFFFF)
-#define MIN_PORT	((uint32_t)0x0)
+static void
+_vtsock_populate_header(struct virtio_vsock_hdr *hdr, uint16_t op, struct vsock_pcb *pcb)
+{
+	hdr->src_port = pcb->local_addr.svm_port;
+	hdr->src_cid = pcb->local_addr.svm_cid;
+	hdr->dst_port = pcb->remote_addr.svm_port;
+	hdr->dst_cid = pcb->remote_addr.svm_cid;
+	hdr->op = op;
+	hdr->type = _vtsock_get_type(pcb);
+}
 
 static int
-vsock_dom_probe(void)
+_vtsock_can_send_more(void)
 {
-	if (!device_is_attached(vsock_softc->vtsock_dev)) {
-		printf("Calling dom_probe but virtio_socket is not attached\n");
-	}
-
-	return (0);
-}
-
-static void
-vsock_init(void *arg __unused)
-{
-	mtx_init(&vsock_pcbs_mtx,
-		  "vsock_pcbs_mtx", NULL, MTX_DEF);
-
-	LIST_INIT(&vsock_pcbs);
-
-	mtx_init(&vsock_bound_pcbs_mtx,
-		  "vsock_bound_pcbs_mtx", NULL, MTX_DEF);
-
-	LIST_INIT(&vsock_bound_pcbs);
-}
-
-SYSINIT(vsock_init, SI_SUB_PROTO_DOMAIN, SI_ORDER_THIRD, vsock_init, NULL);
-
-static void
-vsock_pcb_insert(struct vsock_pcb *pcb, int list)
-{
-	if (list == VSOCK_CONNECTED_LIST) {
-		mtx_lock(&vsock_pcbs_mtx);
-		LIST_INSERT_HEAD(&vsock_pcbs, pcb, next);
-		mtx_unlock(&vsock_pcbs_mtx);
-	} else if (list == VSOCK_BOUND_LIST) {
-		mtx_lock(&vsock_bound_pcbs_mtx);
-		LIST_INSERT_HEAD(&vsock_bound_pcbs, pcb, next);
-		mtx_unlock(&vsock_bound_pcbs_mtx);
-	}
-}
-
-static void
-vsock_pcb_remove(struct vsock_pcb *pcb, int list)
-{
-	struct vsock_pcb *p;
-
-	if (list == VSOCK_CONNECTED_LIST) {
-		mtx_lock(&vsock_pcbs_mtx);
-		LIST_FOREACH(p, &vsock_pcbs, next)
-		if (p == pcb) {
-			LIST_REMOVE(pcb, next);
-		}
-		mtx_unlock(&vsock_pcbs_mtx);
-	} else if (list == VSOCK_BOUND_LIST) {
-		mtx_lock(&vsock_bound_pcbs_mtx);
-		LIST_FOREACH(p, &vsock_bound_pcbs, next)
-		if (p == pcb) {
-			LIST_REMOVE(pcb, next);
-		}
-		mtx_unlock(&vsock_bound_pcbs_mtx);
-	}
-}
-
-static struct vsock_pcb *
-vsock_pcb_lookup(uint32_t local_port, uint32_t remote_port, int list)
-{
-	struct vsock_pcb *p = NULL;
-
-	if (list == VSOCK_CONNECTED_LIST) {
-		mtx_lock(&vsock_pcbs_mtx);
-		LIST_FOREACH(p, &vsock_pcbs, next)
-		if (p->so &&
-			local_port == p->local_addr.svm_port &&
-			remote_port == p->remote_addr.svm_port) {
-			mtx_unlock(&vsock_pcbs_mtx);
-			return p;
-		}
-		mtx_unlock(&vsock_pcbs_mtx);
-	} else if (list == VSOCK_BOUND_LIST) {
-		mtx_lock(&vsock_bound_pcbs_mtx);
-		LIST_FOREACH(p, &vsock_bound_pcbs, next)
-		if (p->so &&
-			local_port == p->local_addr.svm_port &&
-			remote_port == 0) {
-			mtx_unlock(&vsock_bound_pcbs_mtx);
-			return p;
-		}
-		mtx_unlock(&vsock_bound_pcbs_mtx);
-	}
-
-	return p;
-}
-
-int
-vsock_attach(struct socket *so, int proto, struct thread *td)
-{
-	printf("Creating socket\n");
-
-	struct vsock_pcb *pcb;
-	int error;
-
-	pcb = malloc(sizeof(struct vsock_pcb), M_VSOCK, M_NOWAIT | M_ZERO);
-	if (pcb == NULL) {
-		return (ENOMEM);
-	}
-
-	pcb->so = so;
-	so->so_pcb = pcb;
-	error = soreserve(so, 8196, 8196);
-
-	return (error);
-}
-
-void
-vsock_detach(struct socket *so)
-{
-
-	printf("Destroying socket\n");
-	struct vsock_pcb *pcb = so2vsockpcb(so);
-
-	if (pcb == NULL)
-		return;
-
-	printf("Removing pcb\n");
-	if (SOLISTENING(so)) {
-		vsock_pcb_remove(pcb, VSOCK_BOUND_LIST);
-	} else {
-		vsock_pcb_remove(pcb, VSOCK_CONNECTED_LIST);
-	}
-	free(pcb, M_VSOCK);
-	so->so_pcb = NULL;
-
-        sbrelease(so, SO_RCV);
-        sbrelease(so, SO_SND);
-}
-
-int
-vsock_bind(struct socket *so, struct sockaddr *addr, struct thread *td)
-{
-	struct vsock_pcb *pcb = so2vsockpcb(so);
-	struct sockaddr_vm *sa = (struct sockaddr_vm *) addr;
-
-	if (sa == NULL) {
-		return (EINVAL);
-	}
-
-	if (pcb == NULL) {
-		return (EINVAL);
-	}
-
-	if (sa->svm_family != AF_VSOCK) {
-		return (EAFNOSUPPORT);
-	}
-
-	if (sa->svm_len != sizeof(*sa)) {
-		return (EINVAL);
-	}
-
-	pcb->local_addr.svm_port = sa->svm_port;
-	pcb->local_addr.svm_cid = vtsock_get_local_cid();
-	pcb->local_addr.svm_family = AF_VSOCK;
-	pcb->local_addr.svm_len = sizeof(*sa);
-
-	vsock_pcb_insert(pcb, VSOCK_BOUND_LIST);
-
-	return (0);
-}
-
-int
-vsock_listen(struct socket *so, int backlog, struct thread *td)
-{
-	int error;
-
-	SOCK_LOCK(so);
-	error = solisten_proto_check(so);
-	if (error == 0)
-		solisten_proto(so, backlog);
-	SOCK_UNLOCK(so);
-	return (error);
-}
-
-int
-vsock_accept(struct socket *so, struct sockaddr *sa)
-{
-	struct vsock_pcb *pcb = so2vsockpcb(so);
-
-	memcpy(sa, &pcb->remote_addr, pcb->remote_addr.svm_len);
-
-	return (0);
-}
-
-int
-vsock_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
-{
-	struct sockaddr_vm *vsock = (struct sockaddr_vm *) nam;
-	struct vsock_pcb *pcb = so2vsockpcb(so);
-
-	if (pcb == NULL) {
-		return (EINVAL);
-	}
-
-	if (vsock->svm_family != AF_VSOCK) {
-		return (EAFNOSUPPORT);
-	}
-
-	if (vsock->svm_len != sizeof(*vsock)) {
-		return (EINVAL);
-	}
-
-	if (so->so_state & SS_ISCONNECTED) {
-		return (EISCONN);
-	}
-
-	if (so->so_state & (SS_ISDISCONNECTING|SS_ISCONNECTING)) {
-		return (EINPROGRESS);
-	}
-
-	soisconnecting(so);
-
-	vsock_pcb_insert(pcb, VSOCK_CONNECTED_LIST);
-
-	vtsock_connect(so, vsock);
-
-	return (0);
-}
-
-int
-vsock_disconnect(struct socket *so)
-{
-	printf("Calling disconnect\n");
-	struct vsock_pcb *pcb = so2vsockpcb(so);
-
-	struct virtio_vsock_hdr *new_hdr = malloc(VTSOCK_BUFSZ, M_VSOCK, M_NOWAIT | M_ZERO);
-	new_hdr->src_port = pcb->local_addr.svm_port;
-	new_hdr->src_cid = pcb->local_addr.svm_cid;
-	new_hdr->dst_port = pcb->remote_addr.svm_port;
-	new_hdr->dst_cid = pcb->remote_addr.svm_cid;
-	new_hdr->op = VIRTIO_VSOCK_OP_SHUTDOWN;
-	new_hdr->type = VIRTIO_VSOCK_TYPE_STREAM;
-	new_hdr->flags = 3;
-
-	if (so->so_state & SS_ISCONNECTED)
-		vtsock_output((void *) new_hdr, VTSOCK_BUFSZ);
-
-	if ((so->so_state & SS_ISDISCONNECTED) == 0)
-		soisdisconnecting(so);
-
-	return (0);
-}
-
-int
-vsock_sosend(struct socket *so, struct sockaddr *addr, struct uio *uio,
-			 struct mbuf *top, struct mbuf *controlp, int flags, struct thread *td)
-{
-	int res = 0;
-
-	if (uio->uio_resid == 0) {
-		return (EINVAL);
-	}
-
-	SOCK_IO_SEND_LOCK(so, SBLOCKWAIT(flags));
-	res = vtsock_send(so, uio);
-	SOCK_IO_SEND_UNLOCK(so);
-
-	return res;
-}
-
-int
-vsock_peeraddr(struct socket *so, struct sockaddr *sa)
-{
-	struct vsock_pcb *pcb = so2vsockpcb(so);
-
-	memcpy(sa, &pcb->remote_addr, pcb->remote_addr.svm_len);
-
-	return (0);
-}
-
-int
-vsock_sockaddr(struct socket *so, struct sockaddr *sa)
-{
-	struct vsock_pcb *pcb = so2vsockpcb(so);
-
-	memcpy(sa, &pcb->local_addr, pcb->local_addr.svm_len);
-
-	return (0);
-}
-
-void
-vsock_close(struct socket *so)
-{
-	printf("Closing socket\n");
-}
-
-void
-vsock_abort(struct socket *so)
-{
-}
-
-int
-vsock_shutdown(struct socket *so, enum shutdown_how how)
-{
-	return (0);
+	return !virtqueue_full(vtsock_softc->vtsock_txvq);
 }
