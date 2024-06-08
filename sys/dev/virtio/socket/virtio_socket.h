@@ -27,12 +27,14 @@
 #ifndef _VIRTIO_SOCKET_H
 #define _VIRTIO_SOCKET_H
 
-#include <sys/socket.h>
-#include <sys/socketvar.h>
-#include <sys/queue.h>
+#include <sys/types.h>
 
 struct virtio_vsock_config {
 	uint64_t guest_cid;
+};
+
+struct virtio_vsock_event {
+	uint32_t id;
 };
 
 #define VIRTIO_VSOCK_F_STREAM		0
@@ -64,46 +66,6 @@ struct virtio_vsock_config {
 #define VSOCK_BOUND_LIST	0x1
 #define VSOCK_CONNECTED_LIST	0x2
 
-struct virtio_vsock_event {
-	uint32_t id;
-};
+SDT_PROVIDER_DECLARE(vtsock);
 
-struct sockaddr_vm {
-	unsigned char	svm_len;
-	sa_family_t	svm_family;
-	uint32_t	svm_port;
-	uint32_t        svm_cid;
-	unsigned char	svm_zero[sizeof(struct sockaddr) -
-				sizeof(sa_family_t) -
-				sizeof(unsigned char) -
-				sizeof(unsigned int) -
-				sizeof(unsigned int)];
-};
-
-struct vsock_pcb {
-	struct socket		*so;
-	struct sockaddr_vm	local_addr;
-	struct sockaddr_vm	remote_addr;
-	uint32_t		fwd_cnt;
-	uint32_t		tx_cnt;
-	uint32_t		peer_credit;
-	LIST_ENTRY(vsock_pcb)	next;
-};
-
-void	vsock_close(struct socket *);
-void	vsock_detach(struct socket *);
-void	vsock_abort(struct socket *);
-int	vsock_attach(struct socket *, int, struct thread *);
-int	vsock_bind(struct socket *, struct sockaddr *, struct thread *);
-int	vsock_listen(struct socket *, int, struct thread *);
-int	vsock_accept(struct socket *, struct sockaddr *);
-int	vsock_connect(struct socket *, struct sockaddr *, struct thread *);
-int	vsock_peeraddr(struct socket *, struct sockaddr *);
-int	vsock_sockaddr(struct socket *, struct sockaddr *);
-int	vsock_soreceive(struct socket *, struct sockaddr **,
-		struct uio *, struct mbuf **, struct mbuf **, int *);
-int	vsock_sosend(struct socket *, struct sockaddr *, struct uio *,
-		struct mbuf *, struct mbuf *, int, struct thread *);
-int	vsock_disconnect(struct socket *);
-int	vsock_shutdown(struct socket *, enum shutdown_how);
 #endif /* _VIRTIO_SOCKET_H */
