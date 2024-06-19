@@ -30,66 +30,20 @@
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <sys/queue.h>
-#include "sys/sdt.h"
+#include <sys/sdt.h>
+
+#include "vsock_transport.h"
 
 struct sockaddr_vm {
-	unsigned char	svm_len;
+	uint8_t	svm_len;
 	sa_family_t	svm_family;
 	uint32_t	svm_port;
 	uint32_t        svm_cid;
-	unsigned char	svm_zero[sizeof(struct sockaddr) -
+	char		svm_zero[sizeof(struct sockaddr) -
+				sizeof(uint8_t) -
 				sizeof(sa_family_t) -
-				sizeof(unsigned char) -
 				sizeof(unsigned int) -
 				sizeof(unsigned int)];
 };
 
-struct vsock_pcb {
-	struct socket		*so;
-	struct sockaddr_vm	local_addr;
-	struct sockaddr_vm	remote_addr;
-	uint32_t		fwd_cnt;
-	uint32_t		tx_cnt;
-	uint32_t		peer_credit;
-	LIST_ENTRY(vsock_pcb)	next;
-};
-
-struct virtio_transport_ops {
-	uint64_t (*get_local_cid)(void);
-	int (*connect)(struct socket *);
-	int (*disconnect)(struct socket *);
-	int (*send)(struct socket *, struct mbuf *);
-};
-
-
-SDT_PROVIDER_DECLARE(vsock);
-SDT_PROBE_DEFINE1(vsock, , ,create, "struct socket *");
-SDT_PROBE_DEFINE1(vsock, , ,destroy, "struct socket *");
-
-void	vsock_transport_register(struct virtio_transport_ops *);
-void	vsock_transport_deregister(void);
-
-void			vsock_pcb_insert_connected(struct vsock_pcb *pcb);
-void			vsock_pcb_remove_connected(struct vsock_pcb *pcb);
-void			vsock_pcb_insert_bound(struct vsock_pcb *pcb);
-void			vsock_pcb_remove_bound(struct vsock_pcb *pcb);
-struct vsock_pcb *	vsock_pcb_lookup_connected(uint32_t src_port, uint32_t dst_port);
-struct vsock_pcb *	vsock_pcb_lookup_bound(uint32_t src_port, uint32_t dst_port);
-
-void	vsock_close(struct socket *);
-void	vsock_detach(struct socket *);
-void	vsock_abort(struct socket *);
-int	vsock_attach(struct socket *, int, struct thread *);
-int	vsock_bind(struct socket *, struct sockaddr *, struct thread *);
-int	vsock_listen(struct socket *, int, struct thread *);
-int	vsock_accept(struct socket *, struct sockaddr *);
-int	vsock_connect(struct socket *, struct sockaddr *, struct thread *);
-int	vsock_peeraddr(struct socket *, struct sockaddr *);
-int	vsock_sockaddr(struct socket *, struct sockaddr *);
-int	vsock_soreceive(struct socket *, struct sockaddr **,
-		struct uio *, struct mbuf **, struct mbuf **, int *);
-int	vsock_send(struct socket *so, int flags, struct mbuf *m,
-		struct sockaddr *addr, struct mbuf *c, struct thread *td);
-int	vsock_disconnect(struct socket *);
-int	vsock_shutdown(struct socket *, enum shutdown_how);
 #endif /* _NET_VSOCK_H_ */
