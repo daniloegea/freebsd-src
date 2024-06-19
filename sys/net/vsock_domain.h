@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2023, Danilo Egea Gondolfo <danilo@FreeBSD.org>
+ * Copyright (c) 2024, Danilo Egea Gondolfo <danilo@FreeBSD.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -24,60 +24,34 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef _VIRTIO_SOCKET_H
-#define _VIRTIO_SOCKET_H
+#ifndef _NET_VSOCK_DOMAIN_H_
+#define _NET_VSOCK_DOMAIN_H_
 
-#include <sys/types.h>
+#ifdef _KERNEL
+#include <sys/socket.h>
+#include <sys/socketvar.h>
+#include <sys/queue.h>
 
-struct virtio_vsock_config {
-	uint64_t guest_cid;
+#define	VSOCK_RCV_BUFFER_SIZE	65535
+#define	VSOCK_SND_BUFFER_SIZE	65535
+
+struct vsock_addr {
+	uint32_t port;
+	uint32_t cid;
 };
 
-struct virtio_vsock_event {
-	uint32_t id;
+struct vsock_pcb {
+	struct socket			*so;
+	struct vsock_addr		local;
+	struct vsock_addr		remote;
+	uint32_t			fwd_cnt;
+	uint32_t			tx_cnt;
+	uint32_t			peer_credit;
+	uint32_t			last_fwd_cnt;
+	uint32_t			last_buf_alloc;
+	struct vsock_transport_ops 	*ops;
+	LIST_ENTRY(vsock_pcb)		next;
 };
 
-struct virtio_vsock_hdr {
-	uint64_t src_cid;
-	uint64_t dst_cid;
-	uint32_t src_port;
-	uint32_t dst_port;
-	uint32_t len;
-	uint16_t type;
-	uint16_t op;
-	uint32_t flags;
-	uint32_t buf_alloc;
-	uint32_t fwd_cnt;
-} __packed;
-
-#define VIRTIO_VSOCK_F_STREAM		0
-#define VIRTIO_VSOCK_F_SEQPACKET	1
-
-#define VIRTIO_VSOCK_OP_INVALID		0
-/* Connect operations */
-#define VIRTIO_VSOCK_OP_REQUEST		1
-#define VIRTIO_VSOCK_OP_RESPONSE	2
-#define VIRTIO_VSOCK_OP_RST		3
-#define VIRTIO_VSOCK_OP_SHUTDOWN	4
-/* To send payload */
-#define VIRTIO_VSOCK_OP_RW		5
-/* Tell the peer our credit info */
-#define VIRTIO_VSOCK_OP_CREDIT_UPDATE	6
-/* Request the peer to send the credit info to us */
-#define VIRTIO_VSOCK_OP_CREDIT_REQUEST	7
-
-#define VIRTIO_VSOCK_TYPE_STREAM	1
-#define VIRTIO_VSOCK_TYPE_SEQPACKET	2
-
-#define VIRTIO_VSOCK_EVENT_TRANSPORT_RESET	0
-
-/* Flags */
-#define VIRTIO_VSOCK_SHUTDOWN_F_RECEIVE	0
-#define VIRTIO_VSOCK_SHUTDOWN_F_SEND	1
-
-
-#define VSOCK_BOUND_LIST	0x1
-#define VSOCK_CONNECTED_LIST	0x2
-
-
-#endif /* _VIRTIO_SOCKET_H */
+#endif /* _KERNEL */
+#endif /* _NET_VSOCK_DOMAIN_H_ */
