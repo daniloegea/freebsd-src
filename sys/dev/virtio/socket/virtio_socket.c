@@ -69,17 +69,37 @@
 
 #include "virtio_if.h"
 
+struct vtsock_txq {
+	struct mtx		vtstx_mtx;
+	struct vtsock_softc	*vtstx_sc;
+	struct virtqueue	*vtstx_vq;
+	struct sglist		*vtstx_sg;
+};
+
+struct vtsock_rxq {
+	struct mtx		vtsrx_mtx;
+	struct vtsock_softc	*vtsrx_sc;
+	struct virtqueue	*vtsrx_vq;
+	struct sglist		*vtsrx_sg;
+	struct taskqueue	*vtsock_rxq;
+	struct task		vtsock_intrtask;
+};
+
+struct vtsock_eventq {
+	struct mtx		vtsevent_mtx;
+	struct vtsock_softc	*vtsevent_sc;
+	struct virtqueue	*vtsevent_vq;
+	struct sglist		*vtsevent_sg;
+};
+
 struct vtsock_softc {
 	device_t			vtsock_dev;
 	uint64_t			vtsock_features;
-	struct virtio_vsock_config	vtsock_config;
 	struct mtx			vtsock_mtx;
-	struct mtx			vtsock_txvq_mtx;
-	struct virtqueue		*vtsock_txvq;
-	struct virtqueue		*vtsock_rxvq;
-	struct virtqueue		*vtsock_eventvq;
-	struct taskqueue		*vtsock_rxq;
-	struct task			vtsock_intrtask;
+	struct virtio_vsock_config	vtsock_config;
+	struct vtsock_txq		vtsock_txq;
+	struct vtsock_rxq		vtsock_rxq;
+	struct vtsock_eventq		vtsock_eventq;
 };
 
 #define VTSOCK_LOCK(_sc)	mtx_lock(&(_sc)->vtsock_mtx)
@@ -105,7 +125,7 @@ static void	vtsock_read_config(struct vtsock_softc *, struct virtio_vsock_config
 static void	vtsock_event_ctl(void *);
 static void	vtsock_rx_intr_handler(void *);
 static uint64_t	vtsock_get_local_cid(void);
-static int	vtsock_populate_rxvq(struct vtsock_softc *sc);
+static int	vtsock_populate_rxvq(struct vtsock_rxq *rxq);
 static void	vtsock_rxq_tq_deffered(void *xtxq, int pending __unused);
 
 static int 	vtsock_connect(struct vsock_addr *, struct vsock_addr *, uint32_t);
@@ -216,32 +236,32 @@ vtsock_probe(device_t dev)
 }
 
 static int
-vtsock_enqueue_rxvq_buf(struct virtqueue *vq, void *buf, size_t len)
+vtsock_enqueue_rxvq_buf(struct vtsock_rxq *rxq, void *buf, size_t len)
 {
 	int error;
-	struct sglist_seg segs[2];
-	struct sglist sg;
 
-	sglist_init(&sg, 2, segs);
-	error = sglist_append(&sg, buf, len);
+	struct sglist *sg = rxq->vtsrx_sg;
+
+	sglist_reset(sg);
+	error = sglist_append(sg, buf, len);
 	if (error != 0) {
 		return (error);
 	}
 
-	return (virtqueue_enqueue(vq, buf, &sg, 0, sg.sg_nseg));
+	return (virtqueue_enqueue(rxq->vtsrx_vq, buf, sg, 0, sg->sg_nseg));
 }
 
 static int
-vtsock_populate_rxvq(struct vtsock_softc *sc)
+vtsock_populate_rxvq(struct vtsock_rxq *rxq)
 {
 	int nbufs, error;
 	int buf_size = VTSOCK_BUFSZ + sizeof(struct virtio_vsock_hdr);
 	char *buf;
-	struct virtqueue *vq = sc->vtsock_rxvq;
+	struct virtqueue *vq = rxq->vtsrx_vq;
 
 	for (nbufs = 0; !virtqueue_full(vq); nbufs++) {
 		buf = malloc(buf_size, M_DEVBUF, M_WAITOK);
-		error = vtsock_enqueue_rxvq_buf(vq, buf, buf_size);
+		error = vtsock_enqueue_rxvq_buf(rxq, buf, buf_size);
 		if (error)
 			return (error);
 	}
@@ -254,17 +274,17 @@ vtsock_populate_rxvq(struct vtsock_softc *sc)
 }
 
 static int
-vtsock_setup_taskqueue(struct vtsock_softc *sc)
+vtsock_setup_rxq_taskqueue(struct vtsock_rxq *rxq)
 {
 	int error;
-	device_t dev = sc->vtsock_dev;
+	device_t dev = rxq->vtsrx_sc->vtsock_dev;
 
-	TASK_INIT(&sc->vtsock_intrtask, 0, vtsock_rxq_tq_deffered, sc);
-	sc->vtsock_rxq = taskqueue_create("virtio_socket", M_NOWAIT, taskqueue_thread_enqueue, &sc->vtsock_rxq);
-	if (sc->vtsock_rxq == NULL) {
+	TASK_INIT(&rxq->vtsock_intrtask, 0, vtsock_rxq_tq_deffered, rxq);
+	rxq->vtsock_rxq = taskqueue_create("virtio_socket", M_NOWAIT, taskqueue_thread_enqueue, &rxq->vtsock_rxq);
+	if (rxq->vtsock_rxq == NULL) {
 		printf("taskqueue_create returned null\n");
 	}
-	error = taskqueue_start_threads(&sc->vtsock_rxq, 1, PI_NET, "%s rxq", device_get_nameunit(dev));
+	error = taskqueue_start_threads(&rxq->vtsock_rxq, 1, PI_NET, "%s rxq", device_get_nameunit(dev));
 	if (error) {
 		device_printf(dev, "failed to start RX taskqueue: %d\n", error);
 	}
@@ -282,6 +302,10 @@ vtsock_attach(device_t dev)
 	vtsock_softc = sc;
 	sc->vtsock_dev = dev;
 
+	sc->vtsock_txq.vtstx_sc = sc;
+	sc->vtsock_rxq.vtsrx_sc = sc;
+	sc->vtsock_eventq.vtsevent_sc = sc;
+
 	virtio_set_feature_desc(dev, vtsock_feature_desc);
 	error = vtsock_setup_features(sc);
 	if (error) {
@@ -290,7 +314,7 @@ vtsock_attach(device_t dev)
 	}
 
 	mtx_init(&sc->vtsock_mtx, "vtsockmtx", NULL, MTX_DEF);
-	mtx_init(&sc->vtsock_txvq_mtx, "vtsocktxvqmtx", NULL, MTX_SPIN);
+	mtx_init(&sc->vtsock_txq.vtstx_mtx, "vtsocktxvqmtx", NULL, MTX_SPIN);
 
 	vtsock_read_config(sc, &sc->vtsock_config);
 
@@ -302,7 +326,11 @@ vtsock_attach(device_t dev)
 		goto fail;
 	}
 
-	error = vtsock_populate_rxvq(sc);
+	sc->vtsock_txq.vtstx_sg = sglist_alloc(2, M_WAITOK);
+	sc->vtsock_rxq.vtsrx_sg = sglist_alloc(2, M_WAITOK);
+	sc->vtsock_eventq.vtsevent_sg = sglist_alloc(2, M_WAITOK);
+
+	error = vtsock_populate_rxvq(&sc->vtsock_rxq);
 	if (error) {
 		device_printf(dev, "cannot populate RX virtqueue\n");
 		goto fail;
@@ -314,19 +342,19 @@ vtsock_attach(device_t dev)
 		goto fail;
 	}
 
-	error = vtsock_setup_taskqueue(sc);
+	error = vtsock_setup_rxq_taskqueue(&sc->vtsock_rxq);
 	if (error) {
 		device_printf(dev, "failed to setup taskqueue\n");
 		goto fail;
 	}
 
-	error = virtqueue_enable_intr(sc->vtsock_rxvq);
+	error = virtqueue_enable_intr(sc->vtsock_rxq.vtsrx_vq);
 	if (error) {
 		device_printf(dev, "cannot enable interruptions on the RX virtqueue\n");
 		goto fail;
 	}
 
-	error = virtqueue_enable_intr(sc->vtsock_eventvq);
+	error = virtqueue_enable_intr(sc->vtsock_eventq.vtsevent_vq);
 	if (error) {
 		device_printf(dev, "cannot enable interruptions on the event virtqueue\n");
 		goto fail;
@@ -348,6 +376,9 @@ vtsock_detach(device_t dev)
 	struct vtsock_softc *sc;
 	int last = 0;
 	void *buf;
+	struct vtsock_rxq *rxq;
+	struct vtsock_txq *txq;
+	struct vtsock_eventq *eventq;
 
 	// Do not detach if there are active sockets
 	if (refcount_load(&active_sockets) > 0) {
@@ -357,26 +388,36 @@ vtsock_detach(device_t dev)
 	sc = device_get_softc(dev);
 
 	VTSOCK_LOCK(sc);
+
+	rxq = &sc->vtsock_rxq;
+	txq = &sc->vtsock_txq;
+	eventq = &sc->vtsock_eventq;
+
 	if (device_is_attached(dev)) {
-		virtqueue_disable_intr(sc->vtsock_rxvq);
-		virtqueue_disable_intr(sc->vtsock_eventvq);
+		virtqueue_disable_intr(rxq->vtsrx_vq);
+		virtqueue_disable_intr(eventq->vtsevent_vq);
 		virtio_stop(sc->vtsock_dev);
 	}
 
-	while ((buf = virtqueue_drain(sc->vtsock_rxvq, &last)) != NULL) {
+	while ((buf = virtqueue_drain(rxq->vtsrx_vq, &last)) != NULL) {
 		free(buf, M_DEVBUF);
 	}
 
-	while ((buf = virtqueue_drain(sc->vtsock_eventvq, &last)) != NULL) {
+	while ((buf = virtqueue_drain(eventq->vtsevent_vq, &last)) != NULL) {
 		free(buf, M_DEVBUF);
 	}
+
+	sglist_free(rxq->vtsrx_sg);
+	sglist_free(txq->vtstx_sg);
+	sglist_free(eventq->vtsevent_sg);
 
 	VTSOCK_UNLOCK(sc);
 
-	taskqueue_drain_all(sc->vtsock_rxq);
-	taskqueue_free(sc->vtsock_rxq);
+	taskqueue_drain_all(rxq->vtsock_rxq);
+	taskqueue_free(rxq->vtsock_rxq);
 
 	mtx_destroy(&sc->vtsock_mtx);
+	mtx_destroy(&txq->vtstx_mtx);
 
 	vsock_transport_deregister();
 
@@ -418,13 +459,13 @@ vtsock_alloc_virtqueues(struct vtsock_softc *sc)
 	if (vq_info == NULL)
 		return (ENOMEM);
 
-	VQ_ALLOC_INFO_INIT(&vq_info[0], 0, vtsock_rx_intr_handler, sc, &sc->vtsock_rxvq,
+	VQ_ALLOC_INFO_INIT(&vq_info[0], 0, vtsock_rx_intr_handler, &sc->vtsock_rxq, &sc->vtsock_rxq.vtsrx_vq,
 				"%s RX", device_get_nameunit(dev));
 
-	VQ_ALLOC_INFO_INIT(&vq_info[1], 0, NULL, NULL, &sc->vtsock_txvq,
+	VQ_ALLOC_INFO_INIT(&vq_info[1], 0, NULL, NULL, &sc->vtsock_txq.vtstx_vq,
 				"%s TX", device_get_nameunit(dev));
 
-	VQ_ALLOC_INFO_INIT(&vq_info[2], 0, vtsock_event_ctl, sc, &sc->vtsock_eventvq,
+	VQ_ALLOC_INFO_INIT(&vq_info[2], 0, vtsock_event_ctl, sc, &sc->vtsock_eventq.vtsevent_vq,
 				"%s event", device_get_nameunit(dev));
 
 	error = virtio_alloc_virtqueues(dev, 3, vq_info);
@@ -463,25 +504,29 @@ vtsock_event_ctl(void *ctx) {
 static void
 vtsock_output(void *buf, int bufsize)
 {
-	struct sglist_seg segs[2];
-	struct sglist sg;
-	struct virtqueue *vq = vtsock_softc->vtsock_txvq;
+	struct vtsock_txq *txq = &vtsock_softc->vtsock_txq;
+	struct virtqueue *vq = txq->vtstx_vq;
+	struct sglist *sg = txq->vtstx_sg;
 	int error;
-
-	sglist_init(&sg, 2, segs);
-	error = sglist_append(&sg, buf, bufsize);
 
 	SDT_PROBE2(vtsock, , , send, buf, bufsize);
 
-	mtx_lock_spin(&vtsock_softc->vtsock_txvq_mtx);
-	error = virtqueue_enqueue(vq, buf, &sg, sg.sg_nseg, 0);
+	mtx_lock_spin(&txq->vtstx_mtx);
+
+	sglist_reset(sg);
+	error = sglist_append(sg, buf, bufsize);
+	if (error) {
+		printf("sglist_append failed: %d\n", error);
+	}
+
+	error = virtqueue_enqueue(vq, buf, sg, sg->sg_nseg, 0);
 	if (error == 0) {
 		virtqueue_notify(vq);
 		virtqueue_poll(vq, NULL);
 	} else {
 		printf("Virtqueue_enqueue error %d\n", error);
 	}
-	mtx_unlock_spin(&vtsock_softc->vtsock_txvq_mtx);
+	mtx_unlock_spin(&txq->vtstx_mtx);
 }
 
 static int
@@ -589,10 +634,10 @@ more:
 
 static void
 vtsock_rx_intr_handler(void *ctx) {
-	struct vtsock_softc *sc = ctx;
+	struct vtsock_rxq *rxq = ctx;
 	int error;
 
-	error = taskqueue_enqueue(sc->vtsock_rxq, &sc->vtsock_intrtask);
+	error = taskqueue_enqueue(rxq->vtsock_rxq, &rxq->vtsock_intrtask);
 	if (error) {
 		printf("taskqueue_enqueue failed %d\n", error);
 	}
@@ -600,15 +645,13 @@ vtsock_rx_intr_handler(void *ctx) {
 
 static void
 vtsock_rxq_tq_deffered(void *ctx, int pending __unused) {
-	struct vtsock_softc *sc = ctx;
+	struct vtsock_rxq *rxq = ctx;
 	struct virtqueue *vq;
 	uint32_t len = 0;
 	void *buf;
 	int deq;
 
-        VTSOCK_LOCK(sc);
-	vq = sc->vtsock_rxvq;
-        VTSOCK_UNLOCK(sc);
+	vq = rxq->vtsrx_vq;
 
 again:
 
@@ -616,7 +659,7 @@ again:
 
 	while ((buf = virtqueue_dequeue(vq, &len)) != NULL) {
 		vtsock_operation_handler(buf, len);
-		vtsock_enqueue_rxvq_buf(vq, buf, VTSOCK_BUFSZ);
+		vtsock_enqueue_rxvq_buf(rxq, buf, VTSOCK_BUFSZ);
 		deq++;
 	}
 
@@ -759,5 +802,5 @@ vtsock_dec_ref(void)
 static int
 _vtsock_can_send_more(void)
 {
-	return !virtqueue_full(vtsock_softc->vtsock_txvq);
+	return !virtqueue_full(vtsock_softc->vtsock_txq.vtstx_vq);
 }
