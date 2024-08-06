@@ -126,7 +126,7 @@ static void	vtsock_setup_header(struct virtio_vsock_hdr *hdr, struct vsock_addr 
 
 static int	_vtsock_can_send_more(void);
 
-#define VTSOCK_BUFSZ 128
+#define VTSOCK_BUFSZ 256
 
 #define DEBUG_VTSOCK_HEADER(hdr) \
 do { \

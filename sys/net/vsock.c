@@ -470,8 +470,10 @@ vsock_send(struct socket *so, int flags, struct mbuf *m,
 	buf_alloc = space >= 0 ? space : 0;
 	SOCKBUF_UNLOCK(&so->so_rcv);
 
+	SOCK_SENDBUF_LOCK(so);
 	if (m->m_len > pcb->peer_credit) {
-		pcb->ops->request_credit_update(&src, &src, buf_alloc, pcb->fwd_cnt);
+		// This is causing a disconnection
+		pcb->ops->request_credit_update(&src, &dst, buf_alloc, pcb->fwd_cnt);
 		printf("data > peer_credit, calling sbwait()\n");
 		sbwait(so, SO_SND);
 	}
@@ -480,6 +482,7 @@ vsock_send(struct socket *so, int flags, struct mbuf *m,
 	pcb->peer_credit -= m->m_len;
 
 	res = pcb->ops->send(&src, &dst, buf_alloc, pcb->fwd_cnt, m);
+	SOCK_SENDBUF_UNLOCK(so);
 
 	pcb->last_fwd_cnt = pcb->fwd_cnt;
 	pcb->last_buf_alloc = buf_alloc;
