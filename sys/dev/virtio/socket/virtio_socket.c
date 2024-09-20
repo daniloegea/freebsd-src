@@ -132,7 +132,7 @@ static int	vtsock_populate_rxvq(struct vtsock_rxq *rxq);
 static void	vtsock_rxq_tq_deffered(void *xtxq, int pending __unused);
 
 static int	vtsock_shutdown(void *transport, struct vsock_addr *, struct vsock_addr *, int how);
-static void	vtsock_operation_handler(void *buf, size_t len);
+static void	vtsock_operation_handler(struct mbuf *m);
 static void	vtsock_setup_sysctl(struct vtsock_softc *sc);
 static int	vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enum vsock_ops op, struct mbuf *m);
 static int	vtsock_output_mbuf(struct mbuf *m);
@@ -220,33 +220,32 @@ vtsock_probe(device_t dev)
 }
 
 static int
-vtsock_enqueue_rxvq_buf(struct vtsock_rxq *rxq, void *buf, size_t len)
+vtsock_enqueue_rxvq_mbuf(struct vtsock_rxq *rxq, struct mbuf *m)
 {
 	int error;
 
 	struct sglist *sg = rxq->vtsrx_sg;
 
 	sglist_reset(sg);
-	error = sglist_append(sg, buf, len);
+	error = sglist_append_mbuf(sg, m);
 	if (error != 0) {
 		return (error);
 	}
 
-	return (virtqueue_enqueue(rxq->vtsrx_vq, buf, sg, 0, sg->sg_nseg));
+	return (virtqueue_enqueue(rxq->vtsrx_vq, m, sg, 0, sg->sg_nseg));
 }
 
 static int
 vtsock_populate_rxvq(struct vtsock_rxq *rxq)
 {
 	int nbufs, error;
-	// TODO: should I enqueue mbufs in the RX queue?
-	int buf_size = VTSOCK_BUFSZ + sizeof(struct virtio_vtsock_hdr);
-	char *buf;
 	struct virtqueue *vq = rxq->vtsrx_vq;
+	struct mbuf *m;
 
 	for (nbufs = 0; !virtqueue_full(vq); nbufs++) {
-		buf = malloc(buf_size, M_DEVBUF, M_WAITOK);
-		error = vtsock_enqueue_rxvq_buf(rxq, buf, buf_size);
+		m = m_get2(VTSOCK_BUFSZ, M_WAITOK, MT_DATA, 0);
+		m->m_len = VTSOCK_BUFSZ;
+		error = vtsock_enqueue_rxvq_mbuf(rxq, m);
 		if (error)
 			return (error);
 	}
@@ -396,8 +395,8 @@ vtsock_detach(device_t dev)
 		virtio_stop(sc->vtsock_dev);
 	}
 
-	while ((buf = virtqueue_drain(rxq->vtsrx_vq, &last)) != NULL) {
-		free(buf, M_DEVBUF);
+	while ((m = virtqueue_drain(rxq->vtsrx_vq, &last)) != NULL) {
+		m_freem(m);
 	}
 
 	while ((m = virtqueue_drain(txq->vtstx_vq, &last)) != NULL) {
@@ -414,8 +413,10 @@ vtsock_detach(device_t dev)
 
 	VTSOCK_UNLOCK(sc);
 
-	taskqueue_drain_all(rxq->vtsock_rxq);
-	taskqueue_free(rxq->vtsock_rxq);
+	if (rxq->vtsock_rxq != NULL) {
+		taskqueue_drain_all(rxq->vtsock_rxq);
+		taskqueue_free(rxq->vtsock_rxq);
+	}
 
 	mtx_destroy(&sc->vtsock_mtx);
 	mtx_destroy(&txq->vtstx_mtx);
@@ -659,7 +660,7 @@ vtsock_output_mbuf(struct mbuf *m)
 	struct sglist *sg = txq->vtstx_sg;
 	int error;
 
-	SDT_PROBE1(vtsock, , , send, m->m_data);
+	SDT_PROBE1(vtsock, , , send, mtod(m, struct virtio_vtsock_hdr *));
 
 	mtx_lock(&txq->vtstx_mtx);
 
@@ -774,7 +775,7 @@ vtsock_rxq_tq_deffered(void *ctx, int pending __unused) {
 	struct vtsock_rxq *rxq = ctx;
 	struct virtqueue *vq;
 	uint32_t len = 0;
-	void *buf;
+	struct mbuf *m;
 	int deq;
 	int error;
 
@@ -784,9 +785,16 @@ again:
 
 	deq = 0;
 
-	while ((buf = virtqueue_dequeue(vq, &len)) != NULL) {
-		vtsock_operation_handler(buf, len);
-		error = vtsock_enqueue_rxvq_buf(rxq, buf, VTSOCK_BUFSZ);
+	while ((m = virtqueue_dequeue(vq, &len)) != NULL) {
+		m->m_len = len;
+		vtsock_operation_handler(m);
+		m = m_get2(VTSOCK_BUFSZ, M_NOWAIT, MT_DATA, 0);
+		if (m == NULL) {
+			printf("Cannot allocate new mbuf\n");
+			break;
+		}
+		m->m_len = VTSOCK_BUFSZ;
+		error = vtsock_enqueue_rxvq_mbuf(rxq, m);
 		if (error) {
 			printf("virtqueue is out of space: %d\n", error);
 		}
@@ -805,23 +813,23 @@ again:
 }
 
 static void
-vtsock_operation_handler(void *buf, size_t len)
+vtsock_operation_handler(struct mbuf *m)
 {
 	struct vsock_addr src, dst;
 	struct virtio_vtsock_hdr *hdr;
 	struct virtio_socket_data *private;
-	struct mbuf *m = NULL;
 	struct vsock_pcb *pcb;
 	int op = 0;
 
-	hdr = buf;
+	m = m_pullup(m, sizeof(struct virtio_vtsock_hdr));
+	hdr = mtod(m, struct virtio_vtsock_hdr *);
 
 	src.cid = hdr->src_cid;
 	src.port = hdr->src_port;
 	dst.cid = hdr->dst_cid;
 	dst.port = hdr->dst_port;
 
-	SDT_PROBE1(vtsock, , , receive, buf);
+	SDT_PROBE1(vtsock, , , receive, hdr);
 
 	vsock_transport_lock();
 	if (hdr->op == VIRTIO_VTSOCK_OP_REQUEST || hdr->op == VIRTIO_VTSOCK_OP_RESPONSE) {
@@ -846,23 +854,14 @@ vtsock_operation_handler(void *buf, size_t len)
 		break;
 	case VIRTIO_VTSOCK_OP_RW:
 		if (hdr->len <= 0) {
+			vsock_transport_unlock();
 			return;
 		}
-		if (len - sizeof(*hdr) > hdr->len) {
+		if (m_length(m, NULL) - sizeof(*hdr) > hdr->len) {
+			vsock_transport_unlock();
 			return;
 		}
 
-		m = m_get2(hdr->len, M_NOWAIT, MT_DATA, 0);
-		if (m == NULL) {
-			printf("vtsock data: cannot allocate mbuf\n");
-			return;
-		}
-		/*
-		 * TODO: Would it be better to append the buffer as external data?
-		 */
-		if (!m_append(m, hdr->len, (char*)buf + sizeof(*hdr))) {
-			printf("m_append failed\n");
-		}
 		op = VSOCK_DATA;
 		break;
 	case VIRTIO_VTSOCK_OP_RST:
@@ -897,22 +896,22 @@ vtsock_operation_handler(void *buf, size_t len)
 		return;
 	}
 
-	if (m != NULL) {
-		/*
-		* TODO: Improve this logic. Needs to take into account the maximum size
-		* of each packet.
-		* The idea is to send a credit update when the peer's view of our
-		* credit is lower than a certain threshold.
-		*/
-		if ((pcb->fwd_cnt - (private->last_fwd_cnt + 4096)) >= private->last_buf_alloc) {
-			vtsock_send_message(private, &pcb->local, &pcb->remote, VSOCK_CREDIT_UPDATE, NULL);
-		}
+	/*
+	* TODO: Improve this logic. Needs to take into account the maximum size
+	* of each packet.
+	* The idea is to send a credit update when the peer's view of our
+	* credit is lower than a certain threshold.
+	if ((pcb->fwd_cnt - (private->last_fwd_cnt + 4096)) >= private->last_buf_alloc) {
+		vtsock_send_message(private, &pcb->local, &pcb->remote, VSOCK_CREDIT_UPDATE, NULL);
 	}
+	*/
 
+	m_adj(m, sizeof(struct virtio_vtsock_hdr));
 	vsock_input(pcb, &src, &dst, op, m);
 
 	vsock_transport_unlock();
 }
+
 
 static void
 vtsock_setup_sysctl(struct vtsock_softc *sc)
