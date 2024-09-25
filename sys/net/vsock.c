@@ -43,7 +43,7 @@
 #include <sys/domain.h>
 #include <sys/protosw.h>
 #include <sys/socket.h>
-#include <sys/sysctl.h>
+#include <sys/socketvar.h>
 #include <sys/sysproto.h>
 #include <sys/sockbuf.h>
 #include <sys/mbuf.h>
@@ -53,12 +53,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 
-#include <sys/conf.h>
-#include <sys/cons.h>
-#include <sys/tty.h>
-
 #include <sys/sdt.h>
-#include <sys/socketvar.h>
 
 #include <sys/vm_sockets.h>
 #include <net/vsock_transport.h>
@@ -69,7 +64,7 @@
 #define vsockpcb2so(vsockpcb) \
 	((struct socket *)((vsockpcb)->so))
 
-MALLOC_DEFINE(M_VSOCK, "virtio_socket", "virtio socket control structures");
+MALLOC_DEFINE(M_VSOCK, "vsock", "AF_VSOCK data");
 
 static struct rwlock 		vsock_pcbs_connected_rwlock;
 static LIST_HEAD(, vsock_pcb)	vsock_pcbs_connected = LIST_HEAD_INITIALIZER(vsock_pcbs_connected);
@@ -82,7 +77,7 @@ static struct sx 			vsock_transport_sx;
 
 static _Atomic(uint32_t) vsock_last_source_port = 123456;
 
-SYSCTL_NODE(_net, OID_AUTO, vsock, CTLFLAG_RD, 0, "Virtio VSOCK");
+SYSCTL_NODE(_net, OID_AUTO, vsock, CTLFLAG_RD, 0, "AF_VSOCK");
 
 SDT_PROVIDER_DEFINE(vsock);
 SDT_PROBE_DEFINE1(vsock, , ,create, "struct socket *");
@@ -397,7 +392,6 @@ vsock_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
 {
 	struct sockaddr_vm *vsock = (struct sockaddr_vm *) nam;
 	struct vsock_pcb *pcb = so2vsockpcb(so);
-	struct vsock_addr src, dst;
 	int error;
 
 	if (pcb == NULL) {
@@ -432,12 +426,7 @@ vsock_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
 
 	soisconnecting(so);
 
-	src.port = pcb->local.port;
-	src.cid = pcb->local.cid;
-	dst.port = pcb->remote.port;
-	dst.cid = pcb->remote.cid;
-
-	error = pcb->ops->send_message(pcb->transport, &src, &dst, VSOCK_REQUEST, NULL);
+	error = pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, VSOCK_REQUEST, NULL);
 
 	vsock_pcb_insert_bound(pcb);
 
@@ -451,27 +440,21 @@ vsock_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
 static int
 vsock_disconnect(struct socket *so)
 {
-	struct vsock_addr src, dst;
-	int error = 0;
 	struct vsock_pcb *pcb = so2vsockpcb(so);
-
-	src.port = pcb->local.port;
-	src.cid = pcb->local.cid;
-	dst.port = pcb->remote.port;
-	dst.cid = pcb->remote.cid;
+	int error = 0;
 
 	soisdisconnecting(so);
 
 	SOCK_LOCK(so);
 	if ((so->so_state & SS_ISDISCONNECTED) == 0) {
-		error = pcb->ops->send_message(pcb->transport, &src, &dst, VSOCK_DISCONNECT, NULL);
+		error = pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, VSOCK_DISCONNECT, NULL);
 		if (error)
 			goto out;
 
 		error = msleep(&so->so_timeo, &so->so_lock, PSOCK | PCATCH, "disconnect", hz);
 
 		if (error) {
-			error = pcb->ops->send_message(pcb->transport, &src, &dst, VSOCK_RESET, NULL);
+			error = pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, VSOCK_RESET, NULL);
 		}
 	}
 
@@ -486,14 +469,8 @@ static int
 vsock_send(struct socket *so, int flags, struct mbuf *m,
 		    struct sockaddr *addr, struct mbuf *c, struct thread *td)
 {
-	struct vsock_addr src, dst;
-	int len;
 	struct vsock_pcb *pcb = so2vsockpcb(so);
-
-	src.port = pcb->local.port;
-	src.cid = pcb->local.cid;
-	dst.port = pcb->remote.port;
-	dst.cid = pcb->remote.cid;
+	int len;
 
 	len = m_length(m, NULL);
 
@@ -510,7 +487,7 @@ vsock_send(struct socket *so, int flags, struct mbuf *m,
 		return (EPIPE);
 	}
 
-	return pcb->ops->send_message(pcb->transport, &src, &dst, VSOCK_DATA, m);
+	return pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, VSOCK_DATA, m);
 }
 
 int
@@ -585,7 +562,6 @@ vsock_sockaddr(struct socket *so, struct sockaddr *sa)
 static void
 vsock_close(struct socket *so)
 {
-	struct vsock_addr src, dst;
 	struct vsock_pcb *pcb;
 
 	vsock_transport_lock();
@@ -595,11 +571,6 @@ vsock_close(struct socket *so)
 	if (pcb == NULL) {
 		return;
 	}
-
-	src.port = pcb->local.port;
-	src.cid = pcb->local.cid;
-	dst.port = pcb->remote.port;
-	dst.cid = pcb->remote.cid;
 
 	if (SOLISTENING(so)) {
 		vsock_pcb_remove_bound(pcb);
@@ -617,7 +588,6 @@ vsock_abort(struct socket *so)
 static int
 vsock_shutdown(struct socket *so, enum shutdown_how how)
 {
-	struct vsock_addr src, dst;
 	struct vsock_pcb *pcb;
 	int error = 0;
 
@@ -628,11 +598,6 @@ vsock_shutdown(struct socket *so, enum shutdown_how how)
 	if (pcb == NULL) {
 		return -1;
 	}
-
-	src.port = pcb->local.port;
-	src.cid = pcb->local.cid;
-	dst.port = pcb->remote.port;
-	dst.cid = pcb->remote.cid;
 
 	if (SOLISTENING(so)) {
 		if (how != SHUT_WR) {
@@ -659,7 +624,7 @@ vsock_shutdown(struct socket *so, enum shutdown_how how)
 		break;
 	}
 
-	error = pcb->ops->shutdown(pcb->transport, &src, &dst, how);
+	error = pcb->ops->shutdown(pcb->transport, &pcb->local, &pcb->remote, how);
 
 	return (error);
 }
