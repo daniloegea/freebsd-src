@@ -36,25 +36,17 @@
 #include <sys/kdb.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
+#include <sys/condvar.h>
 #include <sys/sglist.h>
 #include <sys/sysctl.h>
 #include <sys/taskqueue.h>
 #include <sys/queue.h>
 #include <sys/sdt.h>
-
 #include <sys/protosw.h>
 #include <sys/socket.h>
-#include <sys/sysctl.h>
 #include <sys/mbuf.h>
-
 #include <sys/types.h>
-#include <sys/uio.h>
-
 #include <sys/refcount.h>
-
-#include <sys/conf.h>
-#include <sys/cons.h>
-#include <sys/tty.h>
 
 #include <machine/bus.h>
 #include <machine/resource.h>
@@ -109,7 +101,7 @@ struct vtsock_softc {
 static struct vtsock_softc	*vtsock_softc = NULL;
 volatile static u_int		active_sockets = 0;
 
-MALLOC_DEFINE(M_VSOCK, "virtio_socket", "virtio socket control structures");
+MALLOC_DEFINE(M_VTSOCK, "virtio_socket", "virtio socket control structures");
 
 SDT_PROVIDER_DEFINE(vtsock);
 SDT_PROBE_DEFINE1(vtsock, , , receive, "struct virtio_vsock_hdr *");
@@ -675,6 +667,8 @@ again:
 	if (error == 0) {
 		virtqueue_notify(vq);
 	} else if (error == ENOSPC) {
+		// TODO: there are cases where we get here with so_snd locked through
+		// virtio_output_nodata. We can't sleep holding this lock.
 		cv_wait(&txq->vtstx_cv, &txq->vtstx_mtx);
 		goto again;
 	} else {
@@ -885,7 +879,7 @@ vtsock_operation_handler(struct mbuf *m)
 	}
 
 	if (hdr->op == VIRTIO_VTSOCK_OP_CREDIT_UPDATE) {
-	sowwakeup(private->so);
+		sowwakeup(private->so);
 		vsock_transport_unlock();
 		return;
 	}
@@ -950,7 +944,7 @@ vtsock_setup_header(struct virtio_vtsock_hdr *hdr, struct vsock_addr *src,
 static void
 vtsock_attach_socket(struct vsock_pcb *pcb)
 {
-	pcb->transport = malloc(sizeof(struct virtio_socket_data), M_VSOCK, M_NOWAIT | M_ZERO);
+	pcb->transport = malloc(sizeof(struct virtio_socket_data), M_VTSOCK, M_NOWAIT | M_ZERO);
 	((struct virtio_socket_data *)pcb->transport)->so = pcb->so;
 	((struct virtio_socket_data *)pcb->transport)->last_buf_alloc = VSOCK_RCV_BUFFER_SIZE;
 	refcount_acquire(&active_sockets);
@@ -959,7 +953,7 @@ vtsock_attach_socket(struct vsock_pcb *pcb)
 static void
 vtsock_detach_socket(struct vsock_pcb *pcb)
 {
-	free(pcb->transport, M_VSOCK);
+	free(pcb->transport, M_VTSOCK);
 	refcount_release(&active_sockets);
 }
 
