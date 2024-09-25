@@ -619,7 +619,6 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 
 	if (op == VSOCK_DATA) {
 		if (m == NULL) {
-			SOCK_SENDBUF_UNLOCK(private->so);
 			return (EINVAL);
 		}
 
@@ -632,7 +631,6 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 
 			if (private->so->so_state & SS_NBIO) {
 				m_freem(m);
-				SOCK_SENDBUF_UNLOCK(private->so);
 				return (EWOULDBLOCK);
 			}
 
@@ -640,7 +638,6 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 			if (error) {
 				printf("sbwait error: %d\n", error);
 				m_freem(m);
-				SOCK_SENDBUF_UNLOCK(private->so);
 				return (error);
 			}
 
@@ -683,9 +680,6 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 
 	vtsock_setup_header(hdr, src, dst, operation, VIRTIO_VTSOCK_TYPE_STREAM, flags, buf_alloc, fwd_cnt);
 
-	if (op == VSOCK_DATA) {
-		SOCK_SENDBUF_UNLOCK(private->so);
-	}
 	error = vtsock_output_mbuf(m);
 
 	return (error);

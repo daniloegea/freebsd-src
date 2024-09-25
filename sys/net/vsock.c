@@ -471,6 +471,7 @@ vsock_send(struct socket *so, int flags, struct mbuf *m,
 {
 	struct vsock_pcb *pcb = so2vsockpcb(so);
 	int len;
+	int error;
 
 	len = m_length(m, NULL);
 
@@ -487,7 +488,11 @@ vsock_send(struct socket *so, int flags, struct mbuf *m,
 		return (EPIPE);
 	}
 
-	return pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, VSOCK_DATA, m);
+	error =  pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, VSOCK_DATA, m);
+
+	SOCK_SENDBUF_UNLOCK(so);
+
+	return (error);
 }
 
 int
