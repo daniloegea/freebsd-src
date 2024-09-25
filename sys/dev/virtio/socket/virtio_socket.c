@@ -47,6 +47,7 @@
 #include <sys/mbuf.h>
 #include <sys/types.h>
 #include <sys/refcount.h>
+#include <sys/buf_ring.h>
 
 #include <machine/bus.h>
 #include <machine/resource.h>
@@ -66,8 +67,11 @@ struct vtsock_txq {
 	struct mtx		vtstx_mtx;
 	struct cv		vtstx_cv;
 	struct vtsock_softc	*vtstx_sc;
+	struct buf_ring		*vtstx_br;
 	struct virtqueue	*vtstx_vq;
 	struct sglist		*vtstx_sg;
+	struct taskqueue	*vtsock_txq;
+	struct task		vtsock_intrtask;
 };
 
 struct vtsock_rxq {
@@ -122,6 +126,7 @@ static void	vtsock_tx_intr_handler(void *);
 static uint64_t	vtsock_get_local_cid(void);
 static int	vtsock_populate_rxvq(struct vtsock_rxq *rxq);
 static void	vtsock_rxq_tq_deffered(void *xtxq, int pending __unused);
+static void	vtsock_txq_tq_deffered(void *xtxq, int pending __unused);
 
 static int	vtsock_shutdown(void *transport, struct vsock_addr *, struct vsock_addr *, int how);
 static void	vtsock_operation_handler(struct mbuf *m);
@@ -256,7 +261,7 @@ vtsock_setup_rxq_taskqueue(struct vtsock_rxq *rxq)
 	device_t dev = rxq->vtsrx_sc->vtsock_dev;
 
 	TASK_INIT(&rxq->vtsock_intrtask, 0, vtsock_rxq_tq_deffered, rxq);
-	rxq->vtsock_rxq = taskqueue_create("virtio_socket", M_NOWAIT, taskqueue_thread_enqueue, &rxq->vtsock_rxq);
+	rxq->vtsock_rxq = taskqueue_create("virtio_socket RX", M_NOWAIT, taskqueue_thread_enqueue, &rxq->vtsock_rxq);
 	if (rxq->vtsock_rxq == NULL) {
 		printf("taskqueue_create failed\n");
 	}
@@ -267,6 +272,27 @@ vtsock_setup_rxq_taskqueue(struct vtsock_rxq *rxq)
 
 	return error;
 }
+
+static int
+vtsock_setup_txq_taskqueue(struct vtsock_txq *txq)
+{
+	int error;
+	device_t dev = txq->vtstx_sc->vtsock_dev;
+
+	TASK_INIT(&txq->vtsock_intrtask, 0, vtsock_txq_tq_deffered, txq);
+	txq->vtsock_txq = taskqueue_create("virtio_socket TX", M_NOWAIT, taskqueue_thread_enqueue, &txq->vtsock_txq);
+	if (txq->vtsock_txq == NULL) {
+		printf("taskqueue_create failed\n");
+	}
+	error = taskqueue_start_threads(&txq->vtsock_txq, 1, PI_NET, "%s txq", device_get_nameunit(dev));
+	if (error) {
+		device_printf(dev, "failed to start TX taskqueue: %d\n", error);
+	}
+
+	return error;
+}
+
+
 
 static int
 vtsock_attach(device_t dev)
@@ -303,10 +329,14 @@ vtsock_attach(device_t dev)
 		goto fail;
 	}
 
+	// TODO: should I use only M_NOWAIT here?
+
 	// TODO: the number of segments depends on the max size of each packet
 	sc->vtsock_txq.vtstx_sg = sglist_alloc(4, M_WAITOK);
 	sc->vtsock_rxq.vtsrx_sg = sglist_alloc(4, M_WAITOK);
 	sc->vtsock_eventq.vtsevent_sg = sglist_alloc(2, M_WAITOK);
+
+	sc->vtsock_txq.vtstx_br = buf_ring_alloc(4096, M_DEVBUF, M_WAITOK, &sc->vtsock_txq.vtstx_mtx);
 
 	error = vtsock_populate_rxvq(&sc->vtsock_rxq);
 	if (error) {
@@ -322,7 +352,13 @@ vtsock_attach(device_t dev)
 
 	error = vtsock_setup_rxq_taskqueue(&sc->vtsock_rxq);
 	if (error) {
-		device_printf(dev, "failed to setup taskqueue\n");
+		device_printf(dev, "failed to setup RX taskqueue\n");
+		goto fail;
+	}
+
+	error = vtsock_setup_txq_taskqueue(&sc->vtsock_txq);
+	if (error) {
+		device_printf(dev, "failed to setup TX taskqueue\n");
 		goto fail;
 	}
 
@@ -409,6 +445,17 @@ vtsock_detach(device_t dev)
 		taskqueue_drain_all(rxq->vtsock_rxq);
 		taskqueue_free(rxq->vtsock_rxq);
 	}
+
+	if (txq->vtsock_txq != NULL) {
+		taskqueue_drain_all(txq->vtsock_txq);
+		taskqueue_free(txq->vtsock_txq);
+	}
+
+	while(!buf_ring_empty(txq->vtstx_br)) {
+		m = buf_ring_dequeue_sc(txq->vtstx_br);
+		m_free(m);
+	}
+	buf_ring_free(txq->vtstx_br, M_DEVBUF);
 
 	mtx_destroy(&sc->vtsock_mtx);
 	mtx_destroy(&txq->vtstx_mtx);
@@ -648,33 +695,17 @@ static int
 vtsock_output_mbuf(struct mbuf *m)
 {
 	struct vtsock_txq *txq = &vtsock_softc->vtsock_txq;
-	struct virtqueue *vq = txq->vtstx_vq;
-	struct sglist *sg = txq->vtstx_sg;
 	int error;
 
 	SDT_PROBE1(vtsock, , , send, mtod(m, struct virtio_vtsock_hdr *));
 
-	mtx_lock(&txq->vtstx_mtx);
+	error = buf_ring_enqueue(txq->vtstx_br, m);
 
-	sglist_reset(sg);
-	error = sglist_append_mbuf(sg, m);
 	if (error) {
-		printf("sglist_append_mbuf failed: %d\n", error);
+		printf("buf_ring_enqueue failed: %d\n", error);
 	}
 
-again:
-	error = virtqueue_enqueue(vq, m, sg, sg->sg_nseg, 0);
-	if (error == 0) {
-		virtqueue_notify(vq);
-	} else if (error == ENOSPC) {
-		// TODO: there are cases where we get here with so_snd locked through
-		// virtio_output_nodata. We can't sleep holding this lock.
-		cv_wait(&txq->vtstx_cv, &txq->vtstx_mtx);
-		goto again;
-	} else {
-		printf("virtqueue_enqueue error %d\n", error);
-	}
-	mtx_unlock(&txq->vtstx_mtx);
+	taskqueue_enqueue(txq->vtsock_txq, &txq->vtsock_intrtask);
 
 	return (error);
 }
@@ -765,7 +796,8 @@ vtsock_event_intr_handler(void *ctx)
 }
 
 static void
-vtsock_rxq_tq_deffered(void *ctx, int pending __unused) {
+vtsock_rxq_tq_deffered(void *ctx, int pending __unused)
+{
 	struct vtsock_rxq *rxq = ctx;
 	struct virtqueue *vq;
 	uint32_t len = 0;
@@ -804,6 +836,39 @@ again:
 		// There are more buffers ready in the queue
                 goto again;
         }
+}
+
+static void
+vtsock_txq_tq_deffered(void *ctx, int pending __unused)
+{
+	struct vtsock_txq *txq = ctx;
+	struct virtqueue *vq = txq->vtstx_vq;
+	struct sglist *sg = txq->vtstx_sg;
+	int error;
+	struct mbuf *m;
+
+	mtx_lock(&txq->vtstx_mtx);
+	while(!buf_ring_empty(txq->vtstx_br)) {
+		m = buf_ring_dequeue_sc(txq->vtstx_br);
+		sglist_reset(sg);
+		error = sglist_append_mbuf(sg, m);
+		if (error) {
+			printf("sglist_append_mbuf failed: %d\n", error);
+		}
+
+	again:
+		error = virtqueue_enqueue(vq, m, sg, sg->sg_nseg, 0);
+		if (error == 0) {
+			virtqueue_notify(vq);
+		} else if (error == ENOSPC) {
+			cv_wait(&txq->vtstx_cv, &txq->vtstx_mtx);
+			goto again;
+	} else {
+			printf("virtqueue_enqueue error: %d, mbuf->m_len: %d\n", error, m->m_len);
+		}
+
+	}
+	mtx_unlock(&txq->vtstx_mtx);
 }
 
 static void
