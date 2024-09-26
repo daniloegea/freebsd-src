@@ -102,10 +102,6 @@ int		vsock_receive(struct socket *so, struct sockaddr **psa, struct uio *uio,
 static int	vsock_disconnect(struct socket *);
 static int	vsock_shutdown(struct socket *, enum shutdown_how);
 
-static void	vsock_pcb_insert_connected(struct vsock_pcb *pcb);
-static void	vsock_pcb_remove_connected(struct vsock_pcb *pcb);
-static void	vsock_pcb_insert_bound(struct vsock_pcb *pcb);
-static void	vsock_pcb_remove_bound(struct vsock_pcb *pcb);
 
 static struct protosw vsock_protosw = {
 	.pr_type =		SOCK_STREAM,
@@ -172,7 +168,7 @@ vsock_init(void *arg __unused)
 
 SYSINIT(vsock_init, SI_SUB_PROTO_DOMAIN, SI_ORDER_THIRD, vsock_init, NULL);
 
-static void
+void
 vsock_pcb_insert_connected(struct vsock_pcb *pcb)
 {
 	rw_wlock(&vsock_pcbs_connected_rwlock);
@@ -180,7 +176,7 @@ vsock_pcb_insert_connected(struct vsock_pcb *pcb)
 	rw_wunlock(&vsock_pcbs_connected_rwlock);
 }
 
-static void
+void
 vsock_pcb_remove_connected(struct vsock_pcb *pcb)
 {
 	struct vsock_pcb *p;
@@ -195,7 +191,7 @@ vsock_pcb_remove_connected(struct vsock_pcb *pcb)
 	rw_wunlock(&vsock_pcbs_connected_rwlock);
 }
 
-static void
+void
 vsock_pcb_insert_bound(struct vsock_pcb *pcb)
 {
 	rw_wlock(&vsock_pcbs_bound_rwlock);
@@ -203,7 +199,7 @@ vsock_pcb_insert_bound(struct vsock_pcb *pcb)
 	rw_wunlock(&vsock_pcbs_bound_rwlock);
 }
 
-static void
+void
 vsock_pcb_remove_bound(struct vsock_pcb *pcb)
 {
 	struct vsock_pcb *p;
@@ -649,83 +645,6 @@ vsock_transport_deregister(void)
 	vsock_transport = NULL;
 	mtx_unlock(&vsock_transport_mtx);
 }
-
-int
-vsock_input(struct vsock_pcb *pcb, struct vsock_addr *src, struct vsock_addr *dst, enum vsock_ops op, struct mbuf *m)
-{
-	struct vsock_pcb *new_pcb;
-	struct socket *so;
-	struct socket *new_socket;
-	struct vsock_addr sockaddr;
-
-	so = vsockpcb2so(pcb);
-
-	if (op == VSOCK_REQUEST) {
-		sockaddr.port = dst->port;
-		sockaddr.cid = dst->cid;
-		if (!SOLISTENING(pcb->so)) {
-			vsock_transport->send_message(pcb->transport, dst, src, VSOCK_RESET, NULL);
-			return -1;
-		}
-	} else if (op == VSOCK_RESPONSE) {
-		sockaddr.port = dst->port;
-		sockaddr.cid = dst->cid;
-		if (so->so_state & SS_ISCONNECTING) {
-			soisconnected(so);
-			vsock_pcb_remove_bound(pcb);
-			vsock_pcb_insert_connected(pcb);
-		}
-	}
-
-	if (op == VSOCK_RESET) {
-		if (so->so_state & SS_ISDISCONNECTING) {
-			soisdisconnected(so);
-		} else if (so->so_state & SS_ISCONNECTING) {
-			so->so_error = ECONNREFUSED;
-			soisdisconnected(so);
-		}
-
-	} else if (op == VSOCK_SHUTDOWN) {
-		// TODO: handle flags
-
-		pcb->ops->send_message(pcb->transport, dst, src, VSOCK_RESET, NULL);
-
-		vsock_pcb_remove_connected(pcb);
-		soisdisconnected(so);
-		sowwakeup(so);
-
-	} else if (op == VSOCK_REQUEST) {
-		CURVNET_SET(so->so_vnet);
-		new_socket = sonewconn(so, 0);
-		CURVNET_RESTORE();
-
-		new_pcb = new_socket->so_pcb;
-		new_pcb->local.port = pcb->local.port;
-		new_pcb->local.cid = pcb->ops->get_local_cid();
-		new_pcb->remote.port = src->port;
-		new_pcb->remote.cid = src->cid;
-		new_pcb->ops = pcb->ops;
-		new_pcb->fwd_cnt = 0;
-		new_pcb->ops->copy_transport_state(new_pcb->transport, pcb->transport);
-
-		new_pcb->ops->send_message(new_pcb->transport, dst, src, VSOCK_RESPONSE, NULL);
-
-		soisconnected(new_socket);
-		vsock_pcb_insert_connected(new_pcb);
-	} else if (op == VSOCK_DATA) {
-		if ((so->so_state & SS_ISCONNECTED) == 0) {
-			pcb->ops->send_message(pcb->transport, dst, src, VSOCK_RESET, NULL);
-			return -1;
-		}
-
-		SOCKBUF_LOCK(&so->so_rcv);
-		sbappendstream_locked(&so->so_rcv, m, 0);
-		sorwakeup_locked(so);
-	}
-
-	return 0;
-}
-
 
 /*
 * TODO

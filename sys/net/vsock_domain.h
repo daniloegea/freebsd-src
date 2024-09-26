@@ -57,6 +57,11 @@ struct vsock_pcb {
 
 struct vsock_pcb *	vsock_pcb_lookup_connected(struct vsock_addr *remote_addr, struct vsock_addr *local_addr);
 struct vsock_pcb *	vsock_pcb_lookup_bound(struct vsock_addr *addr);
+void			vsock_pcb_insert_connected(struct vsock_pcb *pcb);
+void			vsock_pcb_remove_connected(struct vsock_pcb *pcb);
+void			vsock_pcb_insert_bound(struct vsock_pcb *pcb);
+void			vsock_pcb_remove_bound(struct vsock_pcb *pcb);
+
 
 #endif /* _KERNEL */
 #endif /* _NET_VSOCK_DOMAIN_H_ */
