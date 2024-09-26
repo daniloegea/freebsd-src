@@ -50,7 +50,6 @@ struct vsock_transport_ops {
 	int (*send_message)(void *transport, struct vsock_addr *, struct vsock_addr *, enum vsock_ops, struct mbuf *);
 	void (*attach_socket)(struct vsock_pcb *);
 	void (*detach_socket)(struct vsock_pcb *);
-	void (*copy_transport_state)(void *dst, void *src);
 };
 
 void	vsock_transport_lock(void);
@@ -58,8 +57,6 @@ void	vsock_transport_unlock(void);
 
 void	vsock_transport_register(struct vsock_transport_ops *);
 void	vsock_transport_deregister(void);
-
-int	vsock_input(struct vsock_pcb *pcb, struct vsock_addr *src, struct vsock_addr *dst, enum vsock_ops op, struct mbuf *mbuf);
 
 #endif /* _KERNEL */
 #endif /* _NET_VSOCK_TRANSPORT_H_ */
