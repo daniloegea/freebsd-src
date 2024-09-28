@@ -38,6 +38,8 @@ enum vsock_ops {
 	VSOCK_RESPONSE,
 	VSOCK_RESET,
 	VSOCK_SHUTDOWN,
+	VSOCK_SHUTDOWN_SEND,
+	VSOCK_SHUTDOWN_RECV,
 	VSOCK_DISCONNECT,
 	VSOCK_DATA,
 	VSOCK_CREDIT_UPDATE,
@@ -46,7 +48,6 @@ enum vsock_ops {
 
 struct vsock_transport_ops {
 	uint64_t (*get_local_cid)(void);
-	int (*shutdown)(void *transport, struct vsock_addr *, struct vsock_addr *, int);
 	int (*send_message)(void *transport, struct vsock_addr *, struct vsock_addr *, enum vsock_ops, struct mbuf *);
 	void (*attach_socket)(struct vsock_pcb *);
 	void (*detach_socket)(struct vsock_pcb *);
