@@ -129,7 +129,6 @@ static void	vtsock_tx_intr_handler(void *);
 static void	vtsock_rxq_tq_deffered(void *xtxq, int pending __unused);
 static void	vtsock_txq_tq_deffered(void *xtxq, int pending __unused);
 
-static int	vtsock_shutdown(void *transport, struct vsock_addr *, struct vsock_addr *, int how);
 static void	vtsock_operation_handler(struct mbuf *m);
 static int	vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enum vsock_ops op, struct mbuf *m);
 static int	vtsock_output_mbuf(struct mbuf *m);
@@ -169,7 +168,6 @@ static driver_t vtsock_driver = {
 
 static struct vsock_transport_ops transport = {
 	.get_local_cid = vtsock_get_local_cid,
-	.shutdown = vtsock_shutdown,
 	.send_message = vtsock_send_message,
 	.attach_socket = vtsock_attach_socket,
 	.detach_socket = vtsock_detach_socket,
@@ -540,52 +538,6 @@ vtsock_setup_features(struct vtsock_softc *sc)
 }
 
 static int
-vtsock_shutdown(void *transport, struct vsock_addr *src, struct vsock_addr *dst, int how)
-{
-	int error = 0;
-	int space;
-	uint32_t buf_alloc;
-	struct mbuf *m;
-	struct virtio_vtsock_hdr *hdr;
-	struct virtio_socket_data *private = transport;
-	struct vsock_pcb *pcb = private->so->so_pcb;
-
-	uint32_t flags = 0;
-
-	switch (how) {
-	case SHUT_RD:
-		flags = 1 << VIRTIO_VTSOCK_SHUTDOWN_F_RECEIVE;
-		break;
-	case SHUT_WR:
-		flags = 1 << VIRTIO_VTSOCK_SHUTDOWN_F_SEND;
-		break;
-	case SHUT_RDWR:
-		flags = 1 << VIRTIO_VTSOCK_SHUTDOWN_F_RECEIVE | 1 << VIRTIO_VTSOCK_SHUTDOWN_F_SEND;
-	}
-
-	SOCK_RECVBUF_LOCK(private->so);
-	space = sbspace(&private->so->so_rcv);
-	SOCK_RECVBUF_UNLOCK(private->so);
-	buf_alloc = space >= 0 ? space : 0;
-
-	m = m_get2(sizeof(struct virtio_vtsock_hdr), M_NOWAIT, MT_DATA, 0);
-
-	if (m == NULL) {
-		return (ENOBUFS);
-	}
-
-	m->m_len = sizeof(struct virtio_vtsock_hdr);
-
-	hdr = mtod(m, struct virtio_vtsock_hdr *);
-	hdr->len = 0;
-
-	vtsock_setup_header(hdr, src, dst, VIRTIO_VTSOCK_OP_SHUTDOWN, VIRTIO_VTSOCK_TYPE_STREAM, flags, buf_alloc, pcb->fwd_cnt);
-	error = vtsock_output_mbuf(m);
-
-	return (error);
-}
-
-static int
 vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enum vsock_ops op, struct mbuf *m)
 {
 	int error = 0;
@@ -669,8 +621,14 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 		buf_alloc = space >= 0 ? space : 0;
 	} else if(op == VSOCK_RESET) {
 		operation = VIRTIO_VTSOCK_OP_RST;
-	} else if (op == VSOCK_DISCONNECT) {
+	} else if (op == VSOCK_DISCONNECT || op == VSOCK_SHUTDOWN) {
 		flags = 1 << VIRTIO_VTSOCK_SHUTDOWN_F_RECEIVE | 1 << VIRTIO_VTSOCK_SHUTDOWN_F_SEND;
+		operation = VIRTIO_VTSOCK_OP_SHUTDOWN;
+	} else if(op == VSOCK_SHUTDOWN_SEND) {
+		flags = 1 << VIRTIO_VTSOCK_SHUTDOWN_F_SEND;
+		operation = VIRTIO_VTSOCK_OP_SHUTDOWN;
+	} else if(op == VSOCK_SHUTDOWN_RECV) {
+		flags = 1 << VIRTIO_VTSOCK_SHUTDOWN_F_RECEIVE;
 		operation = VIRTIO_VTSOCK_OP_SHUTDOWN;
 	} else if (op == VSOCK_CREDIT_UPDATE) {
 		operation = VIRTIO_VTSOCK_OP_CREDIT_UPDATE;
