@@ -591,6 +591,7 @@ vsock_shutdown(struct socket *so, enum shutdown_how how)
 {
 	struct vsock_pcb *pcb;
 	int error = 0;
+	enum vsock_ops op = VSOCK_SHUTDOWN;
 
 	SOCK_LOCK(so);
 
@@ -617,15 +618,18 @@ vsock_shutdown(struct socket *so, enum shutdown_how how)
 	switch (how) {
 	case SHUT_RD:
 		sorflush(so);
+		op = VSOCK_SHUTDOWN_RECV;
 		break;
-	case SHUT_RDWR:
-		sorflush(so);
 	case SHUT_WR:
 		socantsendmore(so);
+		op = VSOCK_SHUTDOWN_SEND;
 		break;
+	case SHUT_RDWR:
+		socantsendmore(so);
+		sorflush(so);
 	}
 
-	error = pcb->ops->shutdown(pcb->transport, &pcb->local, &pcb->remote, how);
+	error =  pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, op, NULL);
 
 	return (error);
 }
