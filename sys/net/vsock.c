@@ -259,10 +259,7 @@ vsock_attach(struct socket *so, int proto, struct thread *td)
 
 	SDT_PROBE1(vsock, , , create, so);
 
-	mtx_lock(&vsock_transport_mtx);
-
 	if (vsock_transport == NULL) {
-		mtx_unlock(&vsock_transport_mtx);
 		return (ENXIO);
 	}
 	pcb = malloc(sizeof(struct vsock_pcb), M_VSOCK, M_NOWAIT | M_ZERO);
@@ -277,8 +274,6 @@ vsock_attach(struct socket *so, int proto, struct thread *td)
 	error = soreserve(so, VSOCK_SND_BUFFER_SIZE, VSOCK_RCV_BUFFER_SIZE);
 
 	pcb->ops->attach_socket(pcb);
-
-	mtx_unlock(&vsock_transport_mtx);
 
 	return (error);
 }
@@ -317,17 +312,7 @@ vsock_bind(struct socket *so, struct sockaddr *addr, struct thread *td)
 	struct sockaddr_vm *sa = (struct sockaddr_vm *) addr;
 	struct vsock_addr sockaddr;
 
-	if (sa == NULL) {
-		return (EINVAL);
-	}
-
-	if (pcb == NULL) {
-		return (EINVAL);
-	}
-
-	if (sa->svm_family != AF_VSOCK) {
-		return (EAFNOSUPPORT);
-	}
+	KASSERT(pcb != NULL, ("vsock_bind: pcb == NULL"));
 
 	if (sa->svm_len != sizeof(*sa)) {
 		return (EINVAL);
@@ -372,14 +357,13 @@ vsock_accept(struct socket *so, struct sockaddr *sa)
 	struct vsock_pcb *pcb = so2vsockpcb(so);
 	struct sockaddr_vm sockaddr;
 
-	if (sa != NULL) {
-		sockaddr.svm_len = sizeof(struct sockaddr_vm);
-		sockaddr.svm_family = AF_VSOCK;
-		sockaddr.svm_port = pcb->remote.port;
-		sockaddr.svm_cid = pcb->remote.cid;
+	sockaddr.svm_len = sizeof(struct sockaddr_vm);
+	sockaddr.svm_family = AF_VSOCK;
+	sockaddr.svm_port = pcb->remote.port;
+	sockaddr.svm_cid = pcb->remote.cid;
 
-		memcpy(sa, &sockaddr, sockaddr.svm_len);
-	}
+	memcpy(sa, &sockaddr, sockaddr.svm_len);
+
 	return (0);
 }
 
@@ -390,17 +374,7 @@ vsock_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
 	struct vsock_pcb *pcb = so2vsockpcb(so);
 	int error;
 
-	if (pcb == NULL) {
-		return (EINVAL);
-	}
-
-	if (vsock == NULL) {
-		return (EINVAL);
-	}
-
-	if (vsock->svm_family != AF_VSOCK) {
-		return (EAFNOSUPPORT);
-	}
+	KASSERT(pcb != NULL, ("vsock_connect: pcb == NULL"));
 
 	if (vsock->svm_len != sizeof(*vsock)) {
 		return (EINVAL);
@@ -430,7 +404,7 @@ vsock_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
 		error = EINPROGRESS;
 	}
 
-	return error;
+	return (error);
 }
 
 static int
@@ -438,6 +412,8 @@ vsock_disconnect(struct socket *so)
 {
 	struct vsock_pcb *pcb = so2vsockpcb(so);
 	int error = 0;
+
+	KASSERT(pcb != NULL, ("vsock_diconnect: pcb == NULL"));
 
 	soisdisconnecting(so);
 
@@ -469,6 +445,8 @@ vsock_send(struct socket *so, int flags, struct mbuf *m,
 	int len;
 	int error;
 
+	KASSERT(pcb != NULL, ("vsock_send: pcb == NULL"));
+
 	len = m_length(m, NULL);
 
 	if (len == 0)
@@ -499,6 +477,8 @@ vsock_receive(struct socket *so, struct sockaddr **psa, struct uio *uio,
 
 	ssize_t resid_orig = uio->uio_resid;
 	struct vsock_pcb *pcb = so->so_pcb;
+
+	KASSERT(pcb != NULL, ("vsock_receive: pcb == NULL"));
 
 	error = soreceive_generic(so, psa, uio, mp, controlp, flagsp);
 
@@ -532,14 +512,13 @@ vsock_peeraddr(struct socket *so, struct sockaddr *sa)
 	struct vsock_pcb *pcb = so2vsockpcb(so);
 	struct sockaddr_vm sockaddr;
 
-	if (sa != NULL) {
-		sockaddr.svm_len = sizeof(struct sockaddr_vm);
-		sockaddr.svm_family = AF_VSOCK;
-		sockaddr.svm_port = pcb->remote.port;
-		sockaddr.svm_cid = pcb->remote.cid;
+	sockaddr.svm_len = sizeof(struct sockaddr_vm);
+	sockaddr.svm_family = AF_VSOCK;
+	sockaddr.svm_port = pcb->remote.port;
+	sockaddr.svm_cid = pcb->remote.cid;
 
-		memcpy(sa, &sockaddr, sockaddr.svm_len);
-	}
+	memcpy(sa, &sockaddr, sockaddr.svm_len);
+
 	return (0);
 }
 
@@ -549,14 +528,13 @@ vsock_sockaddr(struct socket *so, struct sockaddr *sa)
 	struct vsock_pcb *pcb = so2vsockpcb(so);
 	struct sockaddr_vm sockaddr;
 
-	if (sa != NULL) {
-		sockaddr.svm_len = sizeof(struct sockaddr_vm);
-		sockaddr.svm_family = AF_VSOCK;
-		sockaddr.svm_port = pcb->local.port;
-		sockaddr.svm_cid = pcb->local.cid;
+	sockaddr.svm_len = sizeof(struct sockaddr_vm);
+	sockaddr.svm_family = AF_VSOCK;
+	sockaddr.svm_port = pcb->local.port;
+	sockaddr.svm_cid = pcb->local.cid;
 
-		memcpy(sa, &sockaddr, sockaddr.svm_len);
-	}
+	memcpy(sa, &sockaddr, sockaddr.svm_len);
+
 	return (0);
 }
 
@@ -569,9 +547,7 @@ vsock_close(struct socket *so)
 
 	pcb = so2vsockpcb(so);
 
-	if (pcb == NULL) {
-		return;
-	}
+	KASSERT(pcb != NULL, ("vsock_close: pcb == NULL"));
 
 	if (SOLISTENING(so)) {
 		vsock_pcb_remove_bound(pcb);
@@ -597,9 +573,7 @@ vsock_shutdown(struct socket *so, enum shutdown_how how)
 
 	pcb = so2vsockpcb(so);
 
-	if (pcb == NULL) {
-		return -1;
-	}
+	KASSERT(pcb != NULL, ("vsock_shutdown: pcb == NULL"));
 
 	if (SOLISTENING(so)) {
 		if (how != SHUT_WR) {
