@@ -558,8 +558,23 @@ vsock_close(struct socket *so)
 static void
 vsock_abort(struct socket *so)
 {
-	// TODO: implement abort()
-	printf("Abort called for socket: %p\n", so);
+	struct vsock_pcb *pcb;
+
+	vsock_transport_lock();
+
+	pcb = so2vsockpcb(so);
+
+	KASSERT(pcb != NULL, ("vsock_abort: pcb == NULL"));
+
+	if (SOLISTENING(so)) {
+		vsock_pcb_remove_bound(pcb);
+	}
+
+	if (so->so_state & SS_ISCONNECTED) {
+		(void) sodisconnect(so);
+	}
+
+	vsock_transport_unlock();
 }
 
 static int
