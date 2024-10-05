@@ -41,11 +41,13 @@ struct sockaddr_vm {
 	sa_family_t	svm_family;
 	uint32_t	svm_port;
 	uint32_t        svm_cid;
+	unsigned char	svm_flags;
 	char		svm_zero[sizeof(struct sockaddr) -
 				sizeof(unsigned char) -
 				sizeof(sa_family_t) -
 				sizeof(unsigned int) -
-				sizeof(unsigned int)];
+				sizeof(unsigned int) -
+				sizeof(unsigned char)];
 };
 
 #endif /* _SYS_VM_SOCKET_H_ */
