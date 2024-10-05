@@ -61,7 +61,6 @@
 #include <dev/virtio/virtqueue.h>
 #include <dev/virtio/socket/virtio_socket.h>
 
-#include "sys/socketvar.h"
 #include "virtio_if.h"
 
 struct vtsock_txq {
@@ -132,6 +131,7 @@ static void	vtsock_operation_handler(struct mbuf *m);
 static int	vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enum vsock_ops op, struct mbuf *m);
 static int	vtsock_output_mbuf(struct mbuf *m);
 static int	vtsock_output_nodata(struct vsock_addr *src, struct vsock_addr *dst, int op, struct virtio_socket_data *private);
+static void	vtsock_post_receive(struct vsock_pcb *);
 static void	vtsock_attach_socket(struct vsock_pcb *);
 static void	vtsock_detach_socket(struct vsock_pcb *);
 static void	vtsock_setup_header(struct virtio_vtsock_hdr *hdr, struct vsock_addr *src,
@@ -167,6 +167,7 @@ static driver_t vtsock_driver = {
 static struct vsock_transport_ops transport = {
 	.get_local_cid = vtsock_get_local_cid,
 	.send_message = vtsock_send_message,
+	.post_receive = vtsock_post_receive,
 	.attach_socket = vtsock_attach_socket,
 	.detach_socket = vtsock_detach_socket,
 };
@@ -331,13 +332,13 @@ vtsock_attach(device_t dev)
 	}
 
 	// TODO: the number of segments depends on the max size of each packet
-	sc->vtsock_txq.vtstx_sg = sglist_alloc(4, M_NOWAIT);
+	sc->vtsock_txq.vtstx_sg = sglist_alloc(VSOCK_SND_BUFFER_SIZE / PAGE_SIZE, M_NOWAIT);
 	if (sc->vtsock_txq.vtstx_sg == NULL) {
 		error = ENOMEM;
 		goto fail;
 	}
 
-	sc->vtsock_rxq.vtsrx_sg = sglist_alloc(4, M_NOWAIT);
+	sc->vtsock_rxq.vtsrx_sg = sglist_alloc(VSOCK_SND_BUFFER_SIZE / PAGE_SIZE, M_NOWAIT);
 	if (sc->vtsock_rxq.vtsrx_sg == NULL) {
 		error = ENOMEM;
 		goto fail;
@@ -662,6 +663,7 @@ vtsock_output_mbuf(struct mbuf *m)
 
 	if (error) {
 		printf("buf_ring_enqueue failed: %d\n", error);
+		return (error);
 	}
 
 	taskqueue_enqueue(txq->vtsock_txq, &txq->vtsock_intrtask);
@@ -818,7 +820,7 @@ vtsock_txq_tq_deffered(void *ctx, int pending __unused)
 		error = virtqueue_enqueue(vq, m, sg, sg->sg_nseg, 0);
 		if (error == 0) {
 			virtqueue_notify(vq);
-		} else if (error == ENOSPC) {
+		} else if (error == ENOSPC || error == EMSGSIZE) {
 			cv_wait(&txq->vtstx_cv, &txq->vtstx_mtx);
 			goto again;
 	} else {
@@ -939,17 +941,6 @@ vtsock_operation_handler(struct mbuf *m)
 		vtsock_output_nodata(&dst, &src, VIRTIO_VTSOCK_OP_RST, NULL);
 	}
 
-
-	/*
-	* TODO: Improve this logic. Needs to take into account the maximum size
-	* of each packet.
-	* The idea is to send a credit update when the peer's view of our
-	* credit is lower than a certain threshold.
-	if ((pcb->fwd_cnt - (private->last_fwd_cnt + 4096)) >= private->last_buf_alloc) {
-		vtsock_send_message(private, &pcb->local, &pcb->remote, VSOCK_CREDIT_UPDATE, NULL);
-	}
-	*/
-
 out:
 	if (m) {
 		m_freem(m);
@@ -957,6 +948,14 @@ out:
 	vsock_transport_unlock();
 }
 
+static void
+vtsock_post_receive(struct vsock_pcb *pcb)
+{
+	struct virtio_socket_data *private = pcb->transport;
+	if ((pcb->fwd_cnt - private->last_fwd_cnt + (VTSOCK_BUFSZ << 4) ) >= private->last_buf_alloc) {
+		vtsock_send_message(private, &pcb->local, &pcb->remote, VSOCK_CREDIT_UPDATE, NULL);
+	}
+}
 
 static void
 vtsock_setup_sysctl(struct vtsock_softc *sc)
