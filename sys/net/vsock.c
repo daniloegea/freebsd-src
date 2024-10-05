@@ -273,6 +273,9 @@ vsock_attach(struct socket *so, int proto, struct thread *td)
 	so->so_pcb = pcb;
 	error = soreserve(so, VSOCK_SND_BUFFER_SIZE, VSOCK_RCV_BUFFER_SIZE);
 
+	pcb->local.cid = VMADDR_CID_ANY;
+	pcb->local.port = VMADDR_PORT_ANY;
+
 	pcb->ops->attach_socket(pcb);
 
 	return (error);
@@ -500,6 +503,7 @@ vsock_receive(struct socket *so, struct sockaddr **psa, struct uio *uio,
 	 */
 	if (!error) {
 		pcb->fwd_cnt += (resid_orig - uio->uio_resid);
+		pcb->ops->post_receive(pcb);
 	}
 
 	return (error);
