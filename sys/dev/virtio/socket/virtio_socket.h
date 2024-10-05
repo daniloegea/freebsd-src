@@ -50,8 +50,8 @@ struct virtio_vtsock_hdr {
 	uint32_t fwd_cnt;
 } __packed;
 
-#define VIRTIO_VTSOCK_F_STREAM		0
-#define VIRTIO_VTSOCK_F_SEQPACKET	1
+#define VIRTIO_VTSOCK_F_STREAM		0x1
+#define VIRTIO_VTSOCK_F_SEQPACKET	0x2
 
 #define VIRTIO_VTSOCK_OP_INVALID	0
 #define VIRTIO_VTSOCK_OP_REQUEST	1
@@ -68,8 +68,8 @@ struct virtio_vtsock_hdr {
 #define VIRTIO_VTSOCK_EVENT_TRANSPORT_RESET	0
 
 /* Flags */
-#define VIRTIO_VTSOCK_SHUTDOWN_F_RECEIVE	0
-#define VIRTIO_VTSOCK_SHUTDOWN_F_SEND	1
+#define VIRTIO_VTSOCK_SHUTDOWN_F_RECEIVE	0x1
+#define VIRTIO_VTSOCK_SHUTDOWN_F_SEND		0x2
 
 #define VTSOCK_BUFSZ 4096
 
