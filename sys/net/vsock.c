@@ -571,7 +571,7 @@ vsock_abort(struct socket *so)
 	}
 
 	if (so->so_state & SS_ISCONNECTED) {
-		(void) sodisconnect(so);
+		sodisconnect(so);
 	}
 
 	vsock_transport_unlock();
