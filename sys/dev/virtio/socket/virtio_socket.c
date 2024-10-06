@@ -640,6 +640,8 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 		operation = VIRTIO_VTSOCK_OP_SHUTDOWN;
 	} else if (op == VSOCK_CREDIT_UPDATE) {
 		operation = VIRTIO_VTSOCK_OP_CREDIT_UPDATE;
+		private->last_fwd_cnt = pcb->fwd_cnt;
+		private->last_buf_alloc = buf_alloc;
 	} else if (op == VSOCK_CREDIT_REQUEST) {
 		operation = VIRTIO_VTSOCK_OP_CREDIT_REQUEST;
 	}
