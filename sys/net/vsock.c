@@ -450,6 +450,9 @@ vsock_send(struct socket *so, int flags, struct mbuf *m,
 
 	KASSERT(pcb != NULL, ("vsock_send: pcb == NULL"));
 
+	// TODO: limit the length of each send?
+	// Write my own version of sosend_generic()?
+
 	len = m_length(m, NULL);
 
 	if (len == 0)
@@ -492,14 +495,7 @@ vsock_receive(struct socket *so, struct sockaddr **psa, struct uio *uio,
 	 * TODO: fwd_cnt is current part of the vsock PCB but it's a concept
 	 * from virtio_socket so it should probably be in the private data.
 	 *
-	 * To do that it will be necessary to write a custom vsock_soreceive that calls
-	 * the transport to dequeue data from the socket buffer, copy to user space and
-	 * records fwd_cnt correctly
-	 *
-	 * TODO: write a custom soreceive and drop the fwd_cnt from the PCB
-	 * OR: create a transport->post_recv() function to record the fwd_cnt and check if
-	 * it should send a credit_update message. It would probably be necessary to protect this call
-	 * with SOCK_IO_RECV_LOCK() so there will be no races when updating fwd_cnt.
+	 * TODO: does the operation below need to be locked?
 	 */
 	if (!error) {
 		pcb->fwd_cnt += (resid_orig - uio->uio_resid);
