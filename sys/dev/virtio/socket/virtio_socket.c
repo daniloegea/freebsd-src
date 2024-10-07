@@ -552,7 +552,7 @@ static int
 vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enum vsock_ops op, struct mbuf *m)
 {
 	int error = 0;
-	int len;
+	uint32_t len;
 	int flags = 0;
 	int operation = 0;
 	uint32_t buf_alloc, fwd_cnt, peer_credit;
@@ -579,46 +579,49 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 	SOCK_RECVBUF_UNLOCK(private->so);
 
 	if (op == VSOCK_DATA) {
-		if (m == NULL) {
-			return (EINVAL);
-		}
+		KASSERT(m != NULL, ("vtsock_send_message: sending data but mbuf is NULL"));
 
 		len = m_length(m, NULL);
 
 		peer_credit = vtsock_get_peer_credit(private);
 
 		while (peer_credit < len) {
-			error = vtsock_output_nodata(dst, src, VIRTIO_VTSOCK_OP_CREDIT_REQUEST, private);
+			error = vtsock_output_nodata(src, dst, VIRTIO_VTSOCK_OP_CREDIT_REQUEST, private);
 
-			// TODO: should I return EWOULDBLOCK from here?
-			// It's very close to the device, sounds like the right thing to do is to wait.
-			/*
-			if (private->so->so_state & SS_NBIO) {
-				m_freem(m);
-				return (EWOULDBLOCK);
-			}
-			*/
-
-			error = sbwait(private->so, SO_SND);
 			if (error) {
-				printf("sbwait error: %d\n", error);
+				printf("credit request failed when peer_credit < len\n");
 				m_freem(m);
 				return (error);
 			}
 
-			peer_credit = vtsock_get_peer_credit(private);
+			/*
+			 * TODO: there are cases where this loop might run forever
+			 * It will happen if the peer never makes room for more data
+			 * We send a credit request, sleep, get the update, wake up,
+			 * check that the peer is still out of credits and loop again
+			 *
+			 * NOTE: is it even correct to use sbwait here?
+			 */
 
+			error = sbwait(private->so, SO_SND);
+			if (error) {
+				m_freem(m);
+				return (error);
+			}
+
+			/* Get out if our peer disconnects while we are stuck here */
+			if ((private->so->so_state & SS_ISCONNECTED) == 0) {
+				m_freem(m);
+				return (ENOTCONN);
+			}
+
+			peer_credit = vtsock_get_peer_credit(private);
 		}
 
 		M_PREPEND(m, sizeof(struct virtio_vtsock_hdr), M_NOWAIT);
 		if (m == NULL) {
-			printf("Can't allocate mbuf vtsock_send_message\n");
-			return -ENOBUFS;
+			return (ENOBUFS);
 		}
-
-		private->tx_cnt += len;
-		private->last_fwd_cnt = fwd_cnt;
-		private->last_buf_alloc = buf_alloc;
 
 		operation = VIRTIO_VTSOCK_OP_RW;
 		hdr = mtod(m, struct virtio_vtsock_hdr *);
@@ -653,6 +656,16 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 	vtsock_setup_header(hdr, src, dst, operation, VIRTIO_VTSOCK_TYPE_STREAM, flags, buf_alloc, fwd_cnt);
 
 	error = vtsock_output_mbuf(m);
+
+	if (error) {
+		return (error);
+	}
+
+	if (op == VSOCK_DATA) {
+		private->tx_cnt += len;
+		private->last_fwd_cnt = fwd_cnt;
+		private->last_buf_alloc = buf_alloc;
+	}
 
 	return (error);
 }
@@ -1020,7 +1033,7 @@ vtsock_detach_socket(struct vsock_pcb *pcb)
 static uint32_t
 vtsock_get_peer_credit(struct virtio_socket_data *private)
 {
-	if (private->peer_buf_alloc < private->tx_cnt - private->peer_fwd_cnt)
+	if (private->peer_buf_alloc < (private->tx_cnt - private->peer_fwd_cnt))
 		return 0;
 	return private->peer_buf_alloc - (private->tx_cnt - private->peer_fwd_cnt);
 }
