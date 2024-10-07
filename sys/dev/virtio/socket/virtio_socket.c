@@ -350,7 +350,7 @@ vtsock_attach(device_t dev)
 		goto fail;
 	}
 
-	sc->vtsock_txq.vtstx_br = buf_ring_alloc(4096, M_DEVBUF, M_NOWAIT, &sc->vtsock_txq.vtstx_mtx);
+	sc->vtsock_txq.vtstx_br = buf_ring_alloc(VTSOCK_TX_RINGBUFFER_SIZE, M_DEVBUF, M_NOWAIT, &sc->vtsock_txq.vtstx_mtx);
 	if (sc->vtsock_txq.vtstx_br == NULL) {
 		error = ENOMEM;
 		goto fail;
@@ -590,10 +590,14 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 		while (peer_credit < len) {
 			error = vtsock_output_nodata(dst, src, VIRTIO_VTSOCK_OP_CREDIT_REQUEST, private);
 
+			// TODO: should I return EWOULDBLOCK from here?
+			// It's very close to the device, sounds like the right thing to do is to wait.
+			/*
 			if (private->so->so_state & SS_NBIO) {
 				m_freem(m);
 				return (EWOULDBLOCK);
 			}
+			*/
 
 			error = sbwait(private->so, SO_SND);
 			if (error) {
@@ -613,7 +617,7 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 		}
 
 		private->tx_cnt += len;
-		private->last_fwd_cnt = pcb->fwd_cnt;
+		private->last_fwd_cnt = fwd_cnt;
 		private->last_buf_alloc = buf_alloc;
 
 		operation = VIRTIO_VTSOCK_OP_RW;
@@ -664,11 +668,10 @@ vtsock_output_mbuf(struct mbuf *m)
 	error = buf_ring_enqueue(txq->vtstx_br, m);
 
 	if (error) {
-		printf("buf_ring_enqueue failed: %d\n", error);
-		return (error);
+		printf("buf_ring_enqueue failed (current lenght: %d): %d\n", buf_ring_count(txq->vtstx_br), error);
 	}
 
-	taskqueue_enqueue(txq->vtsock_txq, &txq->vtsock_intrtask);
+	error = taskqueue_enqueue(txq->vtsock_txq, &txq->vtsock_intrtask);
 
 	return (error);
 }
@@ -875,6 +878,11 @@ vtsock_operation_handler(struct mbuf *m)
 			vtsock_output_nodata(&dst, &src, VIRTIO_VTSOCK_OP_RST, NULL);
 			goto out;
 		}
+
+		/*
+		 * TODO: handle the case when a new connection cannot be accepted.
+		 * sonewconn() might return NULL.
+		*/
 
 		CURVNET_SET(so->so_vnet);
 		newso = sonewconn(so, 0);
