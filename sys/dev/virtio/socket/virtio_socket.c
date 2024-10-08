@@ -586,6 +586,9 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 		peer_credit = vtsock_get_peer_credit(private);
 
 		while (peer_credit < len) {
+
+			private->peer_credit_required = len;
+
 			error = vtsock_output_nodata(src, dst, VIRTIO_VTSOCK_OP_CREDIT_REQUEST, private);
 
 			if (error) {
@@ -608,6 +611,8 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 				m_freem(m);
 				return (error);
 			}
+
+			private->peer_credit_required = 0;
 
 			/* Get out if our peer disconnects while we are stuck here */
 			if ((private->so->so_state & SS_ISCONNECTED) == 0) {
@@ -697,7 +702,6 @@ vtsock_output_nodata(struct vsock_addr *src, struct vsock_addr *dst, int op, str
 	struct mbuf *m;
 	struct virtio_vtsock_hdr *hdr;
 	struct vsock_pcb *pcb = NULL;
-	int error;
 
 	if (private != NULL) {
 		pcb = private->so->so_pcb;
@@ -720,8 +724,7 @@ vtsock_output_nodata(struct vsock_addr *src, struct vsock_addr *dst, int op, str
 
 	vtsock_setup_header(hdr, src, dst, op, VIRTIO_VTSOCK_TYPE_STREAM, 0, buf_alloc, fwd_cnt);
 
-	error = vtsock_output_mbuf(m);
-	return (error);
+	return (vtsock_output_mbuf(m));
 }
 
 static void
@@ -826,8 +829,7 @@ vtsock_txq_tq_deffered(void *ctx, int pending __unused)
 	struct mbuf *m;
 
 	mtx_lock(&txq->vtstx_mtx);
-	while(!buf_ring_empty(txq->vtstx_br)) {
-		m = buf_ring_dequeue_sc(txq->vtstx_br);
+	while((m = buf_ring_dequeue_sc(txq->vtstx_br)) != NULL) {
 		sglist_reset(sg);
 		error = sglist_append_mbuf(sg, m);
 		if (error) {
@@ -841,7 +843,7 @@ vtsock_txq_tq_deffered(void *ctx, int pending __unused)
 		} else if (error == ENOSPC || error == EMSGSIZE) {
 			cv_wait(&txq->vtstx_cv, &txq->vtstx_mtx);
 			goto again;
-	} else {
+		} else {
 			printf("virtqueue_enqueue error: %d, mbuf->m_len: %d\n", error, m->m_len);
 		}
 
@@ -938,7 +940,10 @@ vtsock_operation_handler(struct mbuf *m)
 		soisdisconnected(so);
 		sowwakeup(so);
 	} else if (hdr->op == VIRTIO_VTSOCK_OP_CREDIT_UPDATE) {
-		sowwakeup(private->so);
+		// Don't wake the sender thread up if the credit is not enough
+		if (vtsock_get_peer_credit(private) >= private->peer_credit_required) {
+			sowwakeup(private->so);
+		}
 	} else if (hdr->op == VIRTIO_VTSOCK_OP_CREDIT_REQUEST) {
 		vtsock_output_nodata(&dst, &src, VIRTIO_VTSOCK_OP_CREDIT_UPDATE, private);
 	} else if (hdr->op == VIRTIO_VTSOCK_OP_RW) {
