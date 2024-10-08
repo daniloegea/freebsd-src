@@ -32,8 +32,8 @@
 #include <sys/socketvar.h>
 #include <sys/queue.h>
 
-#define	VSOCK_RCV_BUFFER_SIZE	(256 * 1024)
-#define	VSOCK_SND_BUFFER_SIZE	(256 * 1024)
+#define	VSOCK_RCV_BUFFER_SIZE	(64 * 1024)
+#define	VSOCK_SND_BUFFER_SIZE	(64 * 1024)
 
 struct vsock_addr {
 	uint32_t port;
