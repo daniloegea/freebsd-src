@@ -332,13 +332,13 @@ vtsock_attach(device_t dev)
 	}
 
 	// TODO: the number of segments depends on the max size of each packet
-	sc->vtsock_txq.vtstx_sg = sglist_alloc(VSOCK_SND_BUFFER_SIZE / PAGE_SIZE, M_NOWAIT);
+	sc->vtsock_txq.vtstx_sg = sglist_alloc(VSOCK_SND_BUFFER_SIZE / PAGE_SIZE + 1, M_NOWAIT);
 	if (sc->vtsock_txq.vtstx_sg == NULL) {
 		error = ENOMEM;
 		goto fail;
 	}
 
-	sc->vtsock_rxq.vtsrx_sg = sglist_alloc(VSOCK_SND_BUFFER_SIZE / PAGE_SIZE, M_NOWAIT);
+	sc->vtsock_rxq.vtsrx_sg = sglist_alloc(VSOCK_SND_BUFFER_SIZE / PAGE_SIZE + 1, M_NOWAIT);
 	if (sc->vtsock_rxq.vtsrx_sg == NULL) {
 		error = ENOMEM;
 		goto fail;
