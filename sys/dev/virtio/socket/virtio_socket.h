@@ -71,7 +71,7 @@ struct virtio_vtsock_hdr {
 #define VIRTIO_VTSOCK_SHUTDOWN_F_RECEIVE	0x1
 #define VIRTIO_VTSOCK_SHUTDOWN_F_SEND		0x2
 
-#define VTSOCK_BUFSZ			4096
+#define VTSOCK_BUFSZ			(16 * 1024)
 #define VTSOCK_TX_RINGBUFFER_SIZE	1024
 
 struct virtio_socket_data {
