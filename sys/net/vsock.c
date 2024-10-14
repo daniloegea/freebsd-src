@@ -44,6 +44,7 @@
 #include <sys/protosw.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
+#include <sys/sockio.h>
 #include <sys/sysproto.h>
 #include <sys/sockbuf.h>
 #include <sys/mbuf.h>
@@ -101,6 +102,8 @@ int		vsock_receive(struct socket *so, struct sockaddr **psa, struct uio *uio,
 			struct mbuf **mp, struct mbuf **controlp, int *flagsp);
 static int	vsock_disconnect(struct socket *);
 static int	vsock_shutdown(struct socket *, enum shutdown_how);
+static int	vsock_control(struct socket *, unsigned long, void *,
+			 struct ifnet *, struct thread *);
 
 
 static struct protosw vsock_protosw = {
@@ -121,6 +124,7 @@ static struct protosw vsock_protosw = {
 	.pr_detach =		vsock_detach,
 	.pr_shutdown =		vsock_shutdown,
 	.pr_abort =		vsock_abort,
+	.pr_control =		vsock_control,
 };
 
 static struct domain vsock_domain = {
@@ -486,6 +490,9 @@ vsock_sosend(struct socket *so, struct sockaddr *addr, struct uio *uio,
 		writable = pcb->ops->check_writable(pcb, FALSE);
 
 		if (writable == 0) {
+			// TODO: need to check_writable(pcb, TRUE) here too but
+			// with nonblocking sockets it can happen all the time so need to
+			// find a way to control the amount of calls...
 			if (so->so_state & SS_NBIO) {
 				error = EWOULDBLOCK;
 				SOCK_SENDBUF_UNLOCK(so);
@@ -639,7 +646,6 @@ static int
 vsock_shutdown(struct socket *so, enum shutdown_how how)
 {
 	struct vsock_pcb *pcb;
-	int error = 0;
 	enum vsock_ops op = VSOCK_SHUTDOWN;
 
 	SOCK_LOCK(so);
@@ -676,9 +682,28 @@ vsock_shutdown(struct socket *so, enum shutdown_how how)
 		sorflush(so);
 	}
 
-	error =  pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, op, NULL);
+	return (pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, op, NULL));
+}
 
-	return (error);
+int
+vsock_control(struct socket *so, u_long cmd, void *data, struct ifnet *ifp,
+	      struct thread *td)
+{
+	uint32_t *cid = data;
+	struct vsock_pcb *pcb = so2vsockpcb(so);
+
+	if (pcb->ops == NULL) {
+		return EINVAL;
+	}
+
+	switch (cmd) {
+	case IOCTL_VM_SOCKETS_GET_LOCAL_CID:
+		*cid = pcb->ops->get_local_cid();
+		break;
+	default:
+		*cid = 0;
+	}
+	return 0;
 }
 
 void
@@ -706,4 +731,5 @@ vsock_transport_deregister(void)
 *   - Jails integration
 *   - User credential validation
 *   - Deny ports < 1024 to non-root
+* - Loopback?
 */
