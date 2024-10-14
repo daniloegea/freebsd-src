@@ -151,4 +151,6 @@
 #define	SIOCSUMBPARAM	 _IOW('i', 158, struct ifreq)	/* set MBIM param */
 #define	SIOCGUMBPARAM	_IOWR('i', 159, struct ifreq)	/* get MBIM param */
 
+#define IOCTL_VM_SOCKETS_GET_LOCAL_CID _IOR('s',  160, uint32_t)
+
 #endif /* !_SYS_SOCKIO_H_ */
