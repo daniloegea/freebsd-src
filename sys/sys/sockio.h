@@ -147,4 +147,6 @@
 #define	SIOCSIFCAPNV	_IOW('i', 155, struct ifreq)	/* set IF features */
 #define	SIOCGIFCAPNV	_IOWR('i', 156, struct ifreq)	/* get IF features */
 
+#define IOCTL_VM_SOCKETS_GET_LOCAL_CID _IOR('s',  157, uint32_t)
+
 #endif /* !_SYS_SOCKIO_H_ */
