@@ -80,7 +80,6 @@ struct virtio_socket_data {
 	uint32_t			tx_cnt;
 	uint32_t			peer_buf_alloc;
 	uint32_t			peer_fwd_cnt;
-	uint32_t			peer_credit_required;
 	uint32_t			last_fwd_cnt;
 	uint32_t			last_buf_alloc;
 };
