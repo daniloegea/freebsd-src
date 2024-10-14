@@ -553,7 +553,7 @@ static int
 vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enum vsock_ops op, struct mbuf *m)
 {
 	int error = 0;
-	uint32_t len;
+	uint32_t len = 0;
 	int flags = 0;
 	int operation = 0;
 	uint32_t buf_alloc, fwd_cnt;
@@ -578,6 +578,8 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 	SOCK_RECVBUF_LOCK(private->so);
 	buf_alloc = private->so->so_rcv.sb_hiwat;
 	SOCK_RECVBUF_UNLOCK(private->so);
+	private->last_fwd_cnt = fwd_cnt;
+	private->last_buf_alloc = buf_alloc;
 
 	if (op == VSOCK_DATA) {
 		KASSERT(m != NULL, ("vtsock_send_message: sending data but mbuf is NULL"));
@@ -597,9 +599,6 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 		operation = VIRTIO_VTSOCK_OP_REQUEST;
 	} else if(op == VSOCK_RESPONSE) {
 		operation = VIRTIO_VTSOCK_OP_RESPONSE;
-		SOCK_RECVBUF_LOCK(private->so);
-		buf_alloc = private->so->so_rcv.sb_hiwat;
-		SOCK_RECVBUF_UNLOCK(private->so);
 	} else if(op == VSOCK_RESET) {
 		operation = VIRTIO_VTSOCK_OP_RST;
 	} else if (op == VSOCK_DISCONNECT || op == VSOCK_SHUTDOWN) {
@@ -613,8 +612,6 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 		operation = VIRTIO_VTSOCK_OP_SHUTDOWN;
 	} else if (op == VSOCK_CREDIT_UPDATE) {
 		operation = VIRTIO_VTSOCK_OP_CREDIT_UPDATE;
-		private->last_fwd_cnt = pcb->fwd_cnt;
-		private->last_buf_alloc = buf_alloc;
 	} else if (op == VSOCK_CREDIT_REQUEST) {
 		operation = VIRTIO_VTSOCK_OP_CREDIT_REQUEST;
 	}
@@ -627,11 +624,7 @@ vtsock_send_message(void *transport, struct vsock_addr *src, struct vsock_addr *
 		return (error);
 	}
 
-	if (op == VSOCK_DATA) {
-		private->tx_cnt += len;
-		private->last_fwd_cnt = fwd_cnt;
-		private->last_buf_alloc = buf_alloc;
-	}
+	private->tx_cnt += len;
 
 	return (error);
 }
@@ -714,7 +707,6 @@ again:
 		m_freem(m);
 	}
 
-
 	if (virtqueue_postpone_intr(txq->vtstx_vq, VQ_POSTPONE_LONG) != 0) {
                 goto again;
         }
@@ -772,7 +764,6 @@ again:
 	if (deq > 0) {
 		virtqueue_notify(vq);
 	}
-
 
 	if (virtqueue_enable_intr(vq) != 0) {
 		// There are more buffers ready in the queue
@@ -901,8 +892,8 @@ vtsock_operation_handler(struct mbuf *m)
 		soisdisconnected(so);
 		sowwakeup(so);
 	} else if (hdr->op == VIRTIO_VTSOCK_OP_CREDIT_UPDATE) {
-		// Don't wake the sender thread up if the credit is not enough
-		if (vtsock_get_peer_credit(private) >= private->peer_credit_required) {
+		// Don't wake the sender thread up if the credit is still zero
+		if (vtsock_get_peer_credit(private) > 0) {
 			sowwakeup(private->so);
 		}
 	} else if (hdr->op == VIRTIO_VTSOCK_OP_CREDIT_REQUEST) {
@@ -941,7 +932,12 @@ static void
 vtsock_post_receive(struct vsock_pcb *pcb)
 {
 	struct virtio_socket_data *private = pcb->transport;
-	if ((pcb->fwd_cnt - private->last_fwd_cnt + (VTSOCK_BUFSZ << 4) ) >= private->last_buf_alloc) {
+
+	/*
+	* If the peer's view of our credit is below a threshold (VTSOCK_BUFSZ << 2 here)
+	* send a credit update proactively.
+	*/
+	if ((pcb->fwd_cnt - private->last_fwd_cnt + (VTSOCK_BUFSZ << 2) ) >= private->last_buf_alloc) {
 		vtsock_send_message(private, &pcb->local, &pcb->remote, VSOCK_CREDIT_UPDATE, NULL);
 	}
 }
