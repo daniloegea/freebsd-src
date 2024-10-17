@@ -1,6 +1,7 @@
 /*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
  * Copyright (c) 2024, Danilo Egea Gondolfo <danilo@FreeBSD.org>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -42,9 +43,6 @@
 #include <sys/taskqueue.h>
 #include <sys/queue.h>
 #include <sys/sdt.h>
-#include <sys/protosw.h>
-#include <sys/socket.h>
-#include <sys/mbuf.h>
 #include <sys/types.h>
 #include <sys/refcount.h>
 #include <sys/buf_ring.h>
@@ -53,6 +51,9 @@
 #include <machine/resource.h>
 #include <sys/bus.h>
 
+#include <sys/protosw.h>
+#include <sys/socket.h>
+#include <sys/mbuf.h>
 #include <net/vnet.h>
 #include <net/vsock_domain.h>
 #include <net/vsock_transport.h>
@@ -109,23 +110,23 @@ SDT_PROVIDER_DEFINE(vtsock);
 SDT_PROBE_DEFINE1(vtsock, , , receive, "struct virtio_vsock_hdr *");
 SDT_PROBE_DEFINE1(vtsock, , , send, "struct virtio_vsock_hdr *");
 
-static int	vtsock_probe(device_t);
-static int	vtsock_attach(device_t);
-static int	vtsock_detach(device_t);
-static int	vtsock_config_change(device_t);
-static void	vtsock_read_config(struct vtsock_softc *, struct virtio_vtsock_config *);
+static int	vtsock_probe(device_t dev);
+static int	vtsock_attach(device_t dev);
+static int	vtsock_detach(device_t dev);
+static int	vtsock_config_change(device_t dev);
+static void	vtsock_read_config(struct vtsock_softc *sc, struct virtio_vtsock_config *cfg);
 
-static int	vtsock_alloc_virtqueues(struct vtsock_softc *);
-static int	vtsock_setup_features(struct vtsock_softc *);
+static int	vtsock_alloc_virtqueues(struct vtsock_softc *sc);
+static int	vtsock_setup_features(struct vtsock_softc *sc);
 static void	vtsock_setup_sysctl(struct vtsock_softc *sc);
 static int	vtsock_populate_rxvq(struct vtsock_rxq *rxq);
 static int	vtsock_populate_eventvq(struct vtsock_eventq *eventq);
 static int	vtsock_enqueue_rxvq_mbuf(struct vtsock_rxq *rxq, struct mbuf *m);
-static int	vtsock_setup_taskqueues(struct vtsock_softc *);
+static int	vtsock_setup_taskqueues(struct vtsock_softc *sc);
 
-static void	vtsock_event_intr(void *);
-static void	vtsock_rx_intr(void *);
-static void	vtsock_tx_intr(void *);
+static void	vtsock_event_intr(void *ctx);
+static void	vtsock_rx_intr(void *ctx);
+static void	vtsock_tx_intr(void *ctx);
 static void	vtsock_rx_task(void *xtxq, int pending __unused);
 static void	vtsock_tx_task(void *xtxq, int pending __unused);
 
@@ -133,13 +134,13 @@ static void	vtsock_input(struct mbuf *m);
 static int	vtsock_send(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enum vsock_ops op, struct mbuf *m);
 static int	vtsock_send_control(struct vsock_addr *src, struct vsock_addr *dst, int op, struct virtio_socket_data *private);
 static int	vtsock_output(struct mbuf *m);
-static void	vtsock_post_receive(struct vsock_pcb *);
-static uint32_t	vtsock_check_writable(struct vsock_pcb *, bool);
-static void	vtsock_attach_socket(struct vsock_pcb *);
-static void	vtsock_detach_socket(struct vsock_pcb *);
+static void	vtsock_post_receive(struct vsock_pcb *pcb);
+static uint32_t	vtsock_check_writable(struct vsock_pcb *pcb, bool notify);
+static int	vtsock_attach_socket(struct vsock_pcb *pcb);
+static void	vtsock_detach_socket(struct vsock_pcb *pcb);
 static void	vtsock_setup_header(struct virtio_vtsock_hdr *hdr, struct vsock_addr *src,
-			struct vsock_addr *dst, uint16_t op, uint16_t type, uint32_t flags,
-			uint32_t buf_alloc, uint32_t fwd_cnt);
+		    struct vsock_addr *dst, uint16_t op, uint16_t type, uint32_t flags,
+		    uint32_t buf_alloc, uint32_t fwd_cnt);
 static uint32_t	vtsock_get_peer_credit(struct virtio_socket_data *private);
 static uint64_t	vtsock_get_local_cid(void);
 
@@ -235,9 +236,9 @@ vtsock_enqueue_rxvq_mbuf(struct vtsock_rxq *rxq, struct mbuf *m)
 static int
 vtsock_populate_rxvq(struct vtsock_rxq *rxq)
 {
-	int nbufs, error;
 	struct virtqueue *vq = rxq->vtsrx_vq;
 	struct mbuf *m;
+	int nbufs, error;
 
 	error = 0;
 
@@ -263,9 +264,9 @@ vtsock_populate_rxvq(struct vtsock_rxq *rxq)
 static int
 vtsock_populate_eventvq(struct vtsock_eventq *eventq)
 {
-	int error;
 	struct virtqueue *vq = eventq->vtsevent_vq;
 	struct mbuf *m;
+	int error;
 
 	// Enqueue a single mbuf to the event virtqueue
 
@@ -296,10 +297,10 @@ vtsock_populate_eventvq(struct vtsock_eventq *eventq)
 static int
 vtsock_setup_taskqueues(struct vtsock_softc *sc)
 {
-	int error;
-	device_t dev = sc->vtsock_dev;
 	struct vtsock_rxq *rxq = &sc->vtsock_rxq;
 	struct vtsock_txq *txq = &sc->vtsock_txq;
+	device_t dev = sc->vtsock_dev;
+	int error;
 
 	TASK_INIT(&rxq->vtsock_intrtask, 0, vtsock_rx_task, rxq);
 	TASK_INIT(&txq->vtsock_intrtask, 0, vtsock_tx_task, txq);
@@ -447,11 +448,11 @@ static int
 vtsock_detach(device_t dev)
 {
 	struct vtsock_softc *sc;
-	struct mbuf *m;
 	struct vtsock_rxq *rxq;
 	struct vtsock_txq *txq;
 	struct vtsock_eventq *eventq;
-	int last = 0;
+	struct mbuf *m;
+	int last;
 
 	// Do not detach if there are active sockets
 	// TODO: there is a race here between the moment we inc/dec the counter and
@@ -473,6 +474,7 @@ vtsock_detach(device_t dev)
 		virtio_stop(sc->vtsock_dev);
 	}
 
+	last = 0;
 	while (rxq->vtsrx_vq && (m = virtqueue_drain(rxq->vtsrx_vq, &last)) != NULL) {
 		m_freem(m);
 	}
@@ -487,29 +489,29 @@ vtsock_detach(device_t dev)
 		m_freem(m);
 	}
 
-	if (rxq->vtsrx_sg) {
+	if (rxq->vtsrx_sg != NULL) {
 		sglist_free(rxq->vtsrx_sg);
 	}
 
-	if (txq->vtstx_sg) {
+	if (txq->vtstx_sg != NULL) {
 		sglist_free(txq->vtstx_sg);
 	}
 
-	if (eventq->vtsevent_sg) {
+	if (eventq->vtsevent_sg != NULL) {
 		sglist_free(eventq->vtsevent_sg);
 	}
 
-	if (rxq->vtsock_rxq) {
+	if (rxq->vtsock_rxq != NULL) {
 		taskqueue_drain_all(rxq->vtsock_rxq);
 		taskqueue_free(rxq->vtsock_rxq);
 	}
 
-	if (txq->vtsock_txq) {
+	if (txq->vtsock_txq != NULL) {
 		taskqueue_drain_all(txq->vtsock_txq);
 		taskqueue_free(txq->vtsock_txq);
 	}
 
-	if (txq->vtstx_br) {
+	if (txq->vtstx_br != NULL) {
 		while(!buf_ring_empty(txq->vtstx_br)) {
 			m = buf_ring_dequeue_sc(txq->vtstx_br);
 			m_free(m);
@@ -527,20 +529,19 @@ vtsock_detach(device_t dev)
 }
 
 static void
-vtsock_read_config(struct vtsock_softc *sc, struct virtio_vtsock_config *sockcfg)
+vtsock_read_config(struct vtsock_softc *sc, struct virtio_vtsock_config *cfg)
 {
-	device_t dev;
+	device_t dev = sc->vtsock_dev;
 
-	dev = sc->vtsock_dev;
 	virtio_read_device_config(dev,
-		offsetof(struct virtio_vtsock_config, guest_cid),
-		&sockcfg->guest_cid, sizeof(sockcfg->guest_cid));
+	    offsetof(struct virtio_vtsock_config, guest_cid),
+	    &cfg->guest_cid, sizeof(cfg->guest_cid));
 }
 
 static uint64_t
 vtsock_get_local_cid(void)
 {
-	return vtsock_softc->vtsock_config.guest_cid;
+	return (vtsock_softc->vtsock_config.guest_cid);
 }
 
 static int
@@ -552,24 +553,22 @@ vtsock_config_change(device_t dev)
 static int
 vtsock_alloc_virtqueues(struct vtsock_softc *sc)
 {
-	device_t dev;
 	struct vq_alloc_info *vq_info;
+	device_t dev = sc->vtsock_dev;
 	int error;
-
-	dev = sc->vtsock_dev;
 
 	vq_info = malloc(sizeof(struct vq_alloc_info) * 3, M_TEMP, M_NOWAIT);
 	if (vq_info == NULL)
 		return (ENOMEM);
 
 	VQ_ALLOC_INFO_INIT(&vq_info[0], 0, vtsock_rx_intr, &sc->vtsock_rxq, &sc->vtsock_rxq.vtsrx_vq,
-				"%s RX", device_get_nameunit(dev));
+	    "%s RX", device_get_nameunit(dev));
 
 	VQ_ALLOC_INFO_INIT(&vq_info[1], 0, vtsock_tx_intr, &sc->vtsock_txq, &sc->vtsock_txq.vtstx_vq,
-				"%s TX", device_get_nameunit(dev));
+	    "%s TX", device_get_nameunit(dev));
 
 	VQ_ALLOC_INFO_INIT(&vq_info[2], 0, vtsock_event_intr, &sc->vtsock_eventq, &sc->vtsock_eventq.vtsevent_vq,
-				"%s event", device_get_nameunit(dev));
+	    "%s event", device_get_nameunit(dev));
 
 	error = virtio_alloc_virtqueues(dev, 3, vq_info);
 	free(vq_info, M_TEMP);
@@ -580,10 +579,8 @@ vtsock_alloc_virtqueues(struct vtsock_softc *sc)
 static int
 vtsock_setup_features(struct vtsock_softc *sc)
 {
-	device_t dev;
+	device_t dev = sc->vtsock_dev;
 	uint64_t features = VIRTIO_VTSOCK_F_STREAM;
-
-	dev = sc->vtsock_dev;
 
 	sc->vtsock_features = virtio_negotiate_features(dev, features);
 	return (virtio_finalize_features(dev));
@@ -592,14 +589,13 @@ vtsock_setup_features(struct vtsock_softc *sc)
 static int
 vtsock_send(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enum vsock_ops op, struct mbuf *m)
 {
-	int error = 0;
-	uint32_t len = 0;
-	int flags = 0;
-	int operation = 0;
-	uint32_t buf_alloc, fwd_cnt;
 	struct virtio_vtsock_hdr *hdr;
 	struct virtio_socket_data *private = transport;
 	struct vsock_pcb *pcb = private->so->so_pcb;
+	uint32_t buf_alloc, fwd_cnt, len;
+	int error;
+	int flags = 0;
+	int operation = 0;
 
 	if (op != VSOCK_DATA) {
 		m = m_get2(sizeof(struct virtio_vtsock_hdr), M_NOWAIT, MT_DATA, 0);
@@ -683,19 +679,17 @@ vtsock_output(struct mbuf *m)
 		printf("buf_ring_enqueue failed (current lenght: %d): %d\n", buf_ring_count(txq->vtstx_br), error);
 	}
 
-	error = taskqueue_enqueue(txq->vtsock_txq, &txq->vtsock_intrtask);
-
-	return (error);
+	return (taskqueue_enqueue(txq->vtsock_txq, &txq->vtsock_intrtask));
 }
 
 static int
 vtsock_send_control(struct vsock_addr *src, struct vsock_addr *dst, int op, struct virtio_socket_data *private)
 {
+	struct mbuf *m;
+	struct vsock_pcb *pcb = NULL;
+	struct virtio_vtsock_hdr *hdr;
 	uint32_t fwd_cnt = 0;
 	uint32_t buf_alloc = 0;
-	struct mbuf *m;
-	struct virtio_vtsock_hdr *hdr;
-	struct vsock_pcb *pcb = NULL;
 
 	if (private != NULL) {
 		pcb = private->so->so_pcb;
@@ -736,8 +730,8 @@ vtsock_rx_intr(void *ctx) {
 static void
 vtsock_tx_intr(void *ctx) {
 	struct vtsock_txq *txq = ctx;
-	uint32_t len;
 	struct mbuf *m;
+	uint32_t len;
 
 	mtx_lock(&txq->vtstx_mtx);
 
@@ -785,13 +779,11 @@ static void
 vtsock_rx_task(void *ctx, int pending __unused)
 {
 	struct vtsock_rxq *rxq = ctx;
-	struct virtqueue *vq;
-	uint32_t len = 0;
+	struct virtqueue *vq = rxq->vtsrx_vq;
 	struct mbuf *m;
+	uint32_t len = 0;
 	int deq;
 	int error;
-
-	vq = rxq->vtsrx_vq;
 
 again:
 
@@ -828,9 +820,9 @@ vtsock_tx_task(void *ctx, int pending __unused)
 {
 	struct vtsock_txq *txq = ctx;
 	struct virtqueue *vq = txq->vtstx_vq;
+	struct mbuf *m;
 	struct sglist *sg = txq->vtstx_sg;
 	int error;
-	struct mbuf *m;
 
 	mtx_lock(&txq->vtstx_mtx);
 	while((m = buf_ring_dequeue_sc(txq->vtstx_br)) != NULL) {
@@ -998,39 +990,35 @@ static uint32_t
 vtsock_check_writable(struct vsock_pcb *pcb, bool notify)
 {
 	struct virtio_socket_data *private = pcb->transport;
-	uint32_t credit = vtsock_get_peer_credit(private);
 
 	if (notify) {
 		vtsock_send_control(&pcb->local, &pcb->remote, VIRTIO_VTSOCK_OP_CREDIT_REQUEST, private);
 	}
 
-	return credit;
+	return (vtsock_get_peer_credit(private));
 }
-
-
 
 static void
 vtsock_setup_sysctl(struct vtsock_softc *sc)
 {
-	device_t dev;
+	device_t dev = sc->vtsock_dev;
 	struct sysctl_ctx_list *ctx;
 	struct sysctl_oid *tree;
 	struct sysctl_oid_list *child;
 
-	dev = sc->vtsock_dev;
 	ctx = device_get_sysctl_ctx(dev);
 	tree = device_get_sysctl_tree(dev);
 	child = SYSCTL_CHILDREN(tree);
 
 	SYSCTL_ADD_U64(ctx, child, OID_AUTO, "guest_cid",
-			CTLFLAG_RD, &sc->vtsock_config.guest_cid, sizeof(uint64_t),
-			"Guest context ID");
+	    CTLFLAG_RD, &sc->vtsock_config.guest_cid, sizeof(uint64_t),
+	    "Guest context ID");
 }
 
 static void
 vtsock_setup_header(struct virtio_vtsock_hdr *hdr, struct vsock_addr *src,
-		    struct vsock_addr *dst, uint16_t op, uint16_t type, uint32_t flags,
-		    uint32_t buf_alloc, uint32_t fwd_cnt)
+    struct vsock_addr *dst, uint16_t op, uint16_t type, uint32_t flags,
+    uint32_t buf_alloc, uint32_t fwd_cnt)
 {
 	hdr->src_port = src->port;
 	hdr->src_cid = src->cid;
@@ -1043,13 +1031,23 @@ vtsock_setup_header(struct virtio_vtsock_hdr *hdr, struct vsock_addr *src,
 	hdr->fwd_cnt = fwd_cnt;
 }
 
-static void
+static int
 vtsock_attach_socket(struct vsock_pcb *pcb)
 {
-	pcb->transport = malloc(sizeof(struct virtio_socket_data), M_VTSOCK, M_NOWAIT | M_ZERO);
-	((struct virtio_socket_data *)pcb->transport)->so = pcb->so;
-	((struct virtio_socket_data *)pcb->transport)->last_buf_alloc = VSOCK_RCV_BUFFER_SIZE;
+	// TODO: Handle error from malloc
+	struct virtio_socket_data *private;
+
+	private = malloc(sizeof(struct virtio_socket_data), M_VTSOCK, M_NOWAIT | M_ZERO);
+	if (private == NULL) {
+		return (ENOMEM);
+	}
+	private->so = pcb->so;
+	private->last_buf_alloc = VSOCK_RCV_BUFFER_SIZE;
+
+	pcb->transport = private;
 	refcount_acquire(&active_sockets);
+
+	return (0);
 }
 
 static void
@@ -1062,7 +1060,9 @@ vtsock_detach_socket(struct vsock_pcb *pcb)
 static uint32_t
 vtsock_get_peer_credit(struct virtio_socket_data *private)
 {
-	if (private->peer_buf_alloc < (private->tx_cnt - private->peer_fwd_cnt))
-		return 0;
-	return private->peer_buf_alloc - (private->tx_cnt - private->peer_fwd_cnt);
+	if (private->peer_buf_alloc < (private->tx_cnt - private->peer_fwd_cnt)) {
+		return (0);
+	}
+
+	return (private->peer_buf_alloc - (private->tx_cnt - private->peer_fwd_cnt));
 }

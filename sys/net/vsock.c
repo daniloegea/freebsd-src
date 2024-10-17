@@ -1,6 +1,7 @@
 /*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
  * Copyright (c) 2024, Danilo Egea Gondolfo <danilo@FreeBSD.org>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -86,24 +87,24 @@ SDT_PROBE_DEFINE1(vsock, , ,destroy, "struct socket *");
 
 static int	vsock_dom_probe(void);
 
-static void	vsock_close(struct socket *);
-static void	vsock_detach(struct socket *);
-static void	vsock_abort(struct socket *);
-static int	vsock_attach(struct socket *, int, struct thread *);
-static int	vsock_bind(struct socket *, struct sockaddr *, struct thread *);
-static int	vsock_listen(struct socket *, int, struct thread *);
-static int	vsock_accept(struct socket *, struct sockaddr *);
-static int	vsock_connect(struct socket *, struct sockaddr *, struct thread *);
-static int	vsock_peeraddr(struct socket *, struct sockaddr *);
-static int	vsock_sockaddr(struct socket *, struct sockaddr *);
+static void	vsock_close(struct socket *so);
+static void	vsock_detach(struct socket *so);
+static void	vsock_abort(struct socket *so);
+static int	vsock_attach(struct socket *so, int, struct thread *td);
+static int	vsock_bind(struct socket *so, struct sockaddr *sa, struct thread *td);
+static int	vsock_listen(struct socket *so, int, struct thread *td);
+static int	vsock_accept(struct socket *so, struct sockaddr *td);
+static int	vsock_connect(struct socket *so, struct sockaddr *sa, struct thread *td);
+static int	vsock_peeraddr(struct socket *so, struct sockaddr *sa);
+static int	vsock_sockaddr(struct socket *so, struct sockaddr *sa);
 static int	vsock_sosend(struct socket *so, struct sockaddr *addr, struct uio *uio,
 			struct mbuf *top, struct mbuf *control, int flags, struct thread *td);
 int		vsock_receive(struct socket *so, struct sockaddr **psa, struct uio *uio,
 			struct mbuf **mp, struct mbuf **controlp, int *flagsp);
-static int	vsock_disconnect(struct socket *);
-static int	vsock_shutdown(struct socket *, enum shutdown_how);
-static int	vsock_control(struct socket *, unsigned long, void *,
-			 struct ifnet *, struct thread *);
+static int	vsock_disconnect(struct socket *so);
+static int	vsock_shutdown(struct socket *so, enum shutdown_how);
+static int	vsock_control(struct socket *so, unsigned long cmd, void *data,
+			 struct ifnet *ifp, struct thread *td);
 
 
 static struct protosw vsock_protosw = {
@@ -276,12 +277,14 @@ vsock_attach(struct socket *so, int proto, struct thread *td)
 	so->so_pcb = pcb;
 	error = soreserve(so, 0, VSOCK_RCV_BUFFER_SIZE);
 
+	if (error != 0) {
+		return (error);
+	}
+
 	pcb->local.cid = VMADDR_CID_ANY;
 	pcb->local.port = VMADDR_PORT_ANY;
 
-	pcb->ops->attach_socket(pcb);
-
-	return (error);
+	return (pcb->ops->attach_socket(pcb));
 }
 
 static void

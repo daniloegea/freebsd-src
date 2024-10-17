@@ -1,6 +1,7 @@
 /*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
  * Copyright (c) 2023, Danilo Egea Gondolfo <danilo@FreeBSD.org>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -75,13 +76,13 @@ struct virtio_vtsock_hdr {
 #define VTSOCK_TX_RINGBUFFER_SIZE	1024
 
 struct virtio_socket_data {
-	struct socket			*so;
-	uint32_t			fwd_cnt;
-	uint32_t			tx_cnt;
-	uint32_t			peer_buf_alloc;
-	uint32_t			peer_fwd_cnt;
-	uint32_t			last_fwd_cnt;
-	uint32_t			last_buf_alloc;
+	struct socket	*so;
+	uint32_t	fwd_cnt;
+	uint32_t	tx_cnt;
+	uint32_t	peer_buf_alloc;
+	uint32_t	peer_fwd_cnt;
+	uint32_t	last_fwd_cnt;
+	uint32_t	last_buf_alloc;
 };
 
 #endif /* _VIRTIO_SOCKET_H */
