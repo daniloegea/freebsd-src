@@ -1,6 +1,7 @@
 /*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
  * Copyright (c) 2024, Danilo Egea Gondolfo <danilo@FreeBSD.org>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -51,7 +52,7 @@ struct vsock_transport_ops {
 	int (*send_message)(void *transport, struct vsock_addr *, struct vsock_addr *, enum vsock_ops, struct mbuf *);
 	void (*post_receive)(struct vsock_pcb *);
 	uint32_t (*check_writable)(struct vsock_pcb *, bool);
-	void (*attach_socket)(struct vsock_pcb *);
+	int (*attach_socket)(struct vsock_pcb *);
 	void (*detach_socket)(struct vsock_pcb *);
 };
 
