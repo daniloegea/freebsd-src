@@ -1,6 +1,7 @@
 /*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
  * Copyright (c) 2024, Danilo Egea Gondolfo <danilo@FreeBSD.org>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -55,12 +56,12 @@ struct vsock_pcb {
 };
 
 
-struct vsock_pcb *	vsock_pcb_lookup_connected(struct vsock_addr *remote_addr, struct vsock_addr *local_addr);
-struct vsock_pcb *	vsock_pcb_lookup_bound(struct vsock_addr *addr);
-void			vsock_pcb_insert_connected(struct vsock_pcb *pcb);
-void			vsock_pcb_remove_connected(struct vsock_pcb *pcb);
-void			vsock_pcb_insert_bound(struct vsock_pcb *pcb);
-void			vsock_pcb_remove_bound(struct vsock_pcb *pcb);
+struct vsock_pcb *	vsock_pcb_lookup_connected(struct vsock_addr *, struct vsock_addr *);
+struct vsock_pcb *	vsock_pcb_lookup_bound(struct vsock_addr *);
+void			vsock_pcb_insert_connected(struct vsock_pcb *);
+void			vsock_pcb_remove_connected(struct vsock_pcb *);
+void			vsock_pcb_insert_bound(struct vsock_pcb *);
+void			vsock_pcb_remove_bound(struct vsock_pcb *);
 
 
 #endif /* _KERNEL */
