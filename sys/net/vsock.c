@@ -221,38 +221,38 @@ vsock_pcb_remove_bound(struct vsock_pcb *pcb)
 struct vsock_pcb *
 vsock_pcb_lookup_connected(struct vsock_addr *local_addr, struct vsock_addr *remote_addr)
 {
-	struct vsock_pcb *p = NULL;
+	struct vsock_pcb *pcb = NULL;
 
 	rw_rlock(&vsock_pcbs_connected_rwlock);
-	LIST_FOREACH(p, &vsock_pcbs_connected, next)
-	if (p->so &&
-		local_addr->port == p->local.port &&
-		remote_addr->port == p->remote.port &&
-		local_addr->cid == p->local.cid &&
-		remote_addr->cid == p->remote.cid) {
+	LIST_FOREACH(pcb, &vsock_pcbs_connected, next)
+	if (pcb->so &&
+		local_addr->port == pcb->local.port &&
+		remote_addr->port == pcb->remote.port &&
+		local_addr->cid == pcb->local.cid &&
+		remote_addr->cid == pcb->remote.cid) {
 		rw_runlock(&vsock_pcbs_connected_rwlock);
-		return p;
+		return (pcb);
 	}
 	rw_runlock(&vsock_pcbs_connected_rwlock);
-	return p;
+	return (pcb);
 }
 
 struct vsock_pcb *
 vsock_pcb_lookup_bound(struct vsock_addr *addr)
 {
-	struct vsock_pcb *p = NULL;
+	struct vsock_pcb *pcb = NULL;
 
 	rw_rlock(&vsock_pcbs_bound_rwlock);
-	LIST_FOREACH(p, &vsock_pcbs_bound, next)
-	if (p->so &&
-		addr->port == p->local.port &&
-		(addr->cid == p->local.cid || p->local.cid == VMADDR_CID_ANY)) {
+	LIST_FOREACH(pcb, &vsock_pcbs_bound, next)
+	if (pcb->so &&
+		addr->port == pcb->local.port &&
+		(addr->cid == pcb->local.cid || pcb->local.cid == VMADDR_CID_ANY)) {
 		rw_runlock(&vsock_pcbs_bound_rwlock);
-		return p;
+		return (pcb);
 	}
 	rw_runlock(&vsock_pcbs_bound_rwlock);
 
-	return p;
+	return (pcb);
 }
 
 static int
@@ -696,7 +696,7 @@ vsock_control(struct socket *so, u_long cmd, void *data, struct ifnet *ifp,
 	struct vsock_pcb *pcb = so2vsockpcb(so);
 
 	if (pcb->ops == NULL) {
-		return EINVAL;
+		return (EINVAL);
 	}
 
 	switch (cmd) {
@@ -704,9 +704,10 @@ vsock_control(struct socket *so, u_long cmd, void *data, struct ifnet *ifp,
 		*cid = pcb->ops->get_local_cid();
 		break;
 	default:
-		*cid = 0;
+		return (EINVAL);
 	}
-	return 0;
+
+	return (0);
 }
 
 void
@@ -727,7 +728,6 @@ vsock_transport_deregister(void)
 
 /*
 * TODO
-* - Implement IOCTL_VM_SOCKETS_GET_LOCAL_CID ioctl
 * - Improve port allocation
 * - Store the PCBs in a hash table instead of a list
 * - Security
