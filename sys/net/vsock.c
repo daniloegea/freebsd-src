@@ -263,12 +263,30 @@ vsock_attach(struct socket *so, int proto, struct thread *td)
 
 	SDT_PROBE1(vsock, , , create, so);
 
+	/* sonewconn() is called from the transport code when a new
+	 * connection is received. The transport will be locked while
+	 * a new packet is being processed and sonewconn() calls pr_attach()
+	 * with td == NULL. We use this trick here to differentiate when
+	 * pr_attach() is called from user space and from the transport.
+	 *
+	 * The transport lock is acquired here in order to prevent a race
+	 * when the number of active sockets is checked. We don't want
+	 * to unload the transport while there are sockets in use by
+	 * the vsock layer.
+	 *
+	 */
+	if (td != NULL) {
+		vsock_transport_lock();
+	}
+
 	if (vsock_transport == NULL) {
-		return (ENXIO);
+		error = ENXIO;
+		goto out;
 	}
 	pcb = malloc(sizeof(struct vsock_pcb), M_VSOCK, M_NOWAIT | M_ZERO);
 	if (pcb == NULL) {
-		return (ENOMEM);
+		error = ENOMEM;
+		goto out;
 	}
 
 	pcb->ops = vsock_transport;
@@ -278,13 +296,20 @@ vsock_attach(struct socket *so, int proto, struct thread *td)
 	error = soreserve(so, 0, VSOCK_RCV_BUFFER_SIZE);
 
 	if (error != 0) {
-		return (error);
+		goto out;
 	}
 
 	pcb->local.cid = VMADDR_CID_ANY;
 	pcb->local.port = VMADDR_PORT_ANY;
 
-	return (pcb->ops->attach_socket(pcb));
+	error = pcb->ops->attach_socket(pcb);
+
+out:
+	if (td != NULL) {
+		vsock_transport_unlock();
+	}
+
+	return (error);
 }
 
 static void
@@ -404,10 +429,9 @@ vsock_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
 	pcb->remote.port = vsock->svm_port;
 
 	soisconnecting(so);
+	vsock_pcb_insert_bound(pcb);
 
 	error = pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, VSOCK_REQUEST, NULL);
-
-	vsock_pcb_insert_bound(pcb);
 
 	if (so->so_state & SS_NBIO) {
 		error = EINPROGRESS;
