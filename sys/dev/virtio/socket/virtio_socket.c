@@ -454,10 +454,11 @@ vtsock_detach(device_t dev)
 	struct mbuf *m;
 	int last;
 
+	vsock_transport_lock();
+
 	// Do not detach if there are active sockets
-	// TODO: there is a race here between the moment we inc/dec the counter and
-	// the moment we check it.
 	if (refcount_load(&active_sockets) > 0) {
+		vsock_transport_unlock();
 		return EBUSY;
 	}
 
@@ -524,6 +525,8 @@ vtsock_detach(device_t dev)
 	cv_destroy(&txq->vtstx_cv);
 
 	vsock_transport_deregister();
+
+	vsock_transport_unlock();
 
 	return (0);
 }
@@ -608,6 +611,8 @@ vtsock_send(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enu
 
 		hdr = mtod(m, struct virtio_vtsock_hdr *);
 		hdr->len = 0;
+
+		len = 0;
 	}
 
 	fwd_cnt = pcb->fwd_cnt;
@@ -797,6 +802,7 @@ vtsock_rx_task(void *ctx, int pending __unused)
 	int deq;
 	int error;
 
+	vsock_transport_lock();
 again:
 
 	deq = 0;
@@ -825,6 +831,8 @@ again:
 		// There are more buffers ready in the queue
                 goto again;
         }
+
+	vsock_transport_unlock();
 }
 
 static void
@@ -878,8 +886,6 @@ vtsock_input(struct mbuf *m)
 
 	SDT_PROBE1(vtsock, , , receive, hdr);
 
-	vsock_transport_lock();
-
 	switch (hdr->op) {
 	case VIRTIO_VTSOCK_OP_REQUEST:
 	case VIRTIO_VTSOCK_OP_RESPONSE:
@@ -927,16 +933,17 @@ vtsock_input(struct mbuf *m)
 		newprivate->peer_buf_alloc = private->peer_buf_alloc;
 		newprivate->peer_fwd_cnt = private->peer_fwd_cnt;
 
-		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RESPONSE, newprivate);
-
 		soisconnected(newso);
 		vsock_pcb_insert_connected(newpcb);
+
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RESPONSE, newprivate);
+
 		break;
 	case VIRTIO_VTSOCK_OP_RESPONSE:
 		if (so->so_state & SS_ISCONNECTING) {
-			soisconnected(so);
 			vsock_pcb_remove_bound(pcb);
 			vsock_pcb_insert_connected(pcb);
+			soisconnected(so);
 		} else {
 			vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
 		}
@@ -1000,7 +1007,6 @@ out:
 	if (m) {
 		m_freem(m);
 	}
-	vsock_transport_unlock();
 }
 
 static void
