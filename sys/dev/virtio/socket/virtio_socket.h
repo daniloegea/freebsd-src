@@ -51,9 +51,22 @@ struct virtio_vtsock_hdr {
 	uint32_t fwd_cnt;
 } __packed;
 
+struct virtio_socket_data {
+	struct socket	*so;
+	struct mtx	mtx;
+	uint32_t	fwd_cnt;
+	uint32_t	tx_cnt;
+	uint32_t	peer_buf_alloc;
+	uint32_t	peer_fwd_cnt;
+	uint32_t	last_fwd_cnt;
+	uint32_t	last_buf_alloc;
+};
+
+/* Features */
 #define VIRTIO_VTSOCK_F_STREAM		0x1
 #define VIRTIO_VTSOCK_F_SEQPACKET	0x2
 
+/* Operations */
 #define VIRTIO_VTSOCK_OP_INVALID	0
 #define VIRTIO_VTSOCK_OP_REQUEST	1
 #define VIRTIO_VTSOCK_OP_RESPONSE	2
@@ -64,9 +77,11 @@ struct virtio_vtsock_hdr {
 #define VIRTIO_VTSOCK_OP_CREDIT_REQUEST	7
 #define VIRTIO_VTSOCK_OP_MAX		7
 
+/* Socket types */
 #define VIRTIO_VTSOCK_TYPE_STREAM	1
 #define VIRTIO_VTSOCK_TYPE_SEQPACKET	2
 
+/* Transport events */
 #define VIRTIO_VTSOCK_EVENT_TRANSPORT_RESET	0
 
 /* Flags */
@@ -75,15 +90,5 @@ struct virtio_vtsock_hdr {
 
 #define VTSOCK_BUFSZ			(16 * 1024)
 #define VTSOCK_TX_RINGBUFFER_SIZE	1024
-
-struct virtio_socket_data {
-	struct socket	*so;
-	uint32_t	fwd_cnt;
-	uint32_t	tx_cnt;
-	uint32_t	peer_buf_alloc;
-	uint32_t	peer_fwd_cnt;
-	uint32_t	last_fwd_cnt;
-	uint32_t	last_buf_alloc;
-};
 
 #endif /* _VIRTIO_SOCKET_H */
