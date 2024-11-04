@@ -46,11 +46,10 @@ struct vsock_pcb {
 	struct vsock_addr		local;
 	struct vsock_addr		remote;
 	struct vsock_transport_ops 	*ops;
+	struct mtx			mtx;
 
 	/* Transport private data */
 	void				*transport;
-
-	uint32_t			fwd_cnt;
 
 	LIST_ENTRY(vsock_pcb)		next;
 };
