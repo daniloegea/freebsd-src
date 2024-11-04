@@ -47,10 +47,13 @@ enum vsock_ops {
 	VSOCK_CREDIT_REQUEST
 };
 
+#define VSOCK_LOCK(vpcb) mtx_lock(&(vpcb)->mtx)
+#define VSOCK_UNLOCK(vpcb) mtx_unlock(&(vpcb)->mtx)
+
 struct vsock_transport_ops {
 	uint64_t (*get_local_cid)(void);
 	int (*send_message)(void *transport, struct vsock_addr *, struct vsock_addr *, enum vsock_ops, struct mbuf *);
-	void (*post_receive)(struct vsock_pcb *);
+	void (*post_receive)(struct vsock_pcb *, uint32_t);
 	uint32_t (*check_writable)(struct vsock_pcb *, bool);
 	int (*attach_socket)(struct vsock_pcb *);
 	void (*detach_socket)(struct vsock_pcb *);
