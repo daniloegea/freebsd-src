@@ -105,6 +105,8 @@ static int	vsock_disconnect(struct socket *so);
 static int	vsock_shutdown(struct socket *so, enum shutdown_how);
 static int	vsock_control(struct socket *so, unsigned long cmd, void *data,
 			 struct ifnet *ifp, struct thread *td);
+static struct vsock_pcb *	vsock_pcballoc(void);
+static void	vsock_pcbfree(struct vsock_pcb *pcb);
 
 
 static struct protosw vsock_protosw = {
@@ -118,7 +120,6 @@ static struct protosw vsock_protosw = {
 	.pr_peeraddr =		vsock_peeraddr,
 	.pr_sockaddr =		vsock_sockaddr,
 	.pr_soreceive =		vsock_receive,
-	.pr_sopoll =		sopoll_generic,
 	.pr_sosend =		vsock_sosend,
 	.pr_disconnect =	vsock_disconnect,
 	.pr_close =		vsock_close,
@@ -283,7 +284,7 @@ vsock_attach(struct socket *so, int proto, struct thread *td)
 		error = ENXIO;
 		goto out;
 	}
-	pcb = malloc(sizeof(struct vsock_pcb), M_VSOCK, M_NOWAIT | M_ZERO);
+	pcb = vsock_pcballoc();
 	if (pcb == NULL) {
 		error = ENOMEM;
 		goto out;
@@ -315,7 +316,7 @@ out:
 static void
 vsock_detach(struct socket *so)
 {
-	struct vsock_pcb *pcb = so2vsockpcb(so);
+	struct vsock_pcb *pcb;
 
 	SDT_PROBE1(vsock, , , destroy, so);
 
@@ -323,20 +324,17 @@ vsock_detach(struct socket *so)
 
 	pcb = so2vsockpcb(so);
 
-	if (pcb == NULL) {
-		vsock_transport_unlock();
-		return;
-	}
+	KASSERT(pcb != NULL, ("vsock_detach: pcb == NULL"));
 
 	vsock_pcb_remove_bound(pcb);
 	vsock_pcb_remove_connected(pcb);
 
 	pcb->ops->detach_socket(pcb);
 
-	free(pcb, M_VSOCK);
-	so->so_pcb = NULL;
-
 	vsock_transport_unlock();
+
+	vsock_pcbfree(pcb);
+	so->so_pcb = NULL;
 }
 
 static int
@@ -348,6 +346,10 @@ vsock_bind(struct socket *so, struct sockaddr *addr, struct thread *td)
 
 	KASSERT(pcb != NULL, ("vsock_bind: pcb == NULL"));
 
+	if (addr->sa_family != AF_VSOCK) {
+		return (EAFNOSUPPORT);
+	}
+
 	if (sa->svm_len != sizeof(*sa)) {
 		return (EINVAL);
 	}
@@ -358,16 +360,20 @@ vsock_bind(struct socket *so, struct sockaddr *addr, struct thread *td)
 		return (EADDRNOTAVAIL);
 	}
 
+	VSOCK_LOCK(pcb);
 	pcb->local.port = sa->svm_port;
 	pcb->local.cid = sa->svm_cid;
 
 	sockaddr.cid = sa->svm_cid;
 	sockaddr.port = sa->svm_port;
 	if (vsock_pcb_lookup_bound(&sockaddr) != NULL) {
+		VSOCK_UNLOCK(pcb);
 		return (EADDRINUSE);
 	}
 
 	vsock_pcb_insert_bound(pcb);
+
+	VSOCK_UNLOCK(pcb);
 
 	return (0);
 }
@@ -410,6 +416,10 @@ vsock_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
 
 	KASSERT(pcb != NULL, ("vsock_connect: pcb == NULL"));
 
+	if (nam->sa_family != AF_VSOCK) {
+		return (EAFNOSUPPORT);
+	}
+
 	if (vsock->svm_len != sizeof(*vsock)) {
 		return (EINVAL);
 	}
@@ -422,11 +432,15 @@ vsock_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
 		return (EINPROGRESS);
 	}
 
+	VSOCK_LOCK(pcb);
+
 	pcb->local.cid = pcb->ops->get_local_cid();
 	if (pcb->local.port == VMADDR_PORT_ANY)
 		pcb->local.port = vsock_last_source_port++;
 	pcb->remote.cid = vsock->svm_cid;
 	pcb->remote.port = vsock->svm_port;
+
+	VSOCK_UNLOCK(pcb);
 
 	soisconnecting(so);
 	vsock_pcb_insert_bound(pcb);
@@ -484,6 +498,11 @@ vsock_sosend(struct socket *so, struct sockaddr *addr, struct uio *uio,
 		return (error);
 
 	resid = uio->uio_resid;
+
+	if (addr != NULL && addr->sa_family != AF_VSOCK) {
+		error = EAFNOSUPPORT;
+		goto out;
+	}
 
 	if (resid < 0) {
 		error = EINVAL;
@@ -578,20 +597,10 @@ vsock_receive(struct socket *so, struct sockaddr **psa, struct uio *uio,
 
 	KASSERT(pcb != NULL, ("vsock_receive: pcb == NULL"));
 
-	error = soreceive_generic(so, psa, uio, mp, controlp, flagsp);
+	error = soreceive_stream(so, psa, uio, mp, controlp, flagsp);
 
-	/*
-	 * fwd_cnt is the number of bytes sent to the application so it needs
-	 * to be tracked here.
-	 *
-	 * TODO: fwd_cnt is current part of the vsock PCB but it's a concept
-	 * from virtio_socket so it should probably be in the private data.
-	 *
-	 * TODO: does the operation below need to be locked?
-	 */
 	if (!error) {
-		pcb->fwd_cnt += (resid_orig - uio->uio_resid);
-		pcb->ops->post_receive(pcb);
+		pcb->ops->post_receive(pcb, resid_orig - uio->uio_resid);
 	}
 
 	return (error);
@@ -718,9 +727,13 @@ vsock_control(struct socket *so, u_long cmd, void *data, struct ifnet *ifp,
 {
 	uint32_t *cid = data;
 	struct vsock_pcb *pcb = so2vsockpcb(so);
+	int error = 0;
+
+	VSOCK_LOCK(pcb);
 
 	if (pcb->ops == NULL) {
-		return (EINVAL);
+		error = EINVAL;
+		goto out;
 	}
 
 	switch (cmd) {
@@ -728,10 +741,35 @@ vsock_control(struct socket *so, u_long cmd, void *data, struct ifnet *ifp,
 		*cid = pcb->ops->get_local_cid();
 		break;
 	default:
-		return (EINVAL);
+		error = EINVAL;
+		goto out;
 	}
 
-	return (0);
+out:
+	VSOCK_UNLOCK(pcb);
+	return (error);
+}
+
+struct vsock_pcb *
+vsock_pcballoc(void)
+{
+	struct vsock_pcb *pcb;
+
+	pcb = malloc(sizeof(struct vsock_pcb), M_VSOCK, M_NOWAIT | M_ZERO);
+	if (pcb == NULL) {
+		return (NULL);
+	}
+
+	mtx_init(&pcb->mtx, "vsock PCB mutex", NULL, MTX_DEF);
+
+	return (pcb);
+}
+
+void
+vsock_pcbfree(struct vsock_pcb *pcb)
+{
+	mtx_destroy(&pcb->mtx);
+	free(pcb, M_VSOCK);
 }
 
 void
