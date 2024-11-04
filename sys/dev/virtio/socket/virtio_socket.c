@@ -101,6 +101,8 @@ struct vtsock_softc {
 
 #define VTSOCK_LOCK(_sc)	mtx_lock(&(_sc)->vtsock_mtx)
 #define VTSOCK_UNLOCK(_sc)	mtx_unlock(&(_sc)->vtsock_mtx)
+#define PRIVATE_LOCK(_data)	mtx_lock(&(_data)->mtx)
+#define PRIVATE_UNLOCK(_data)	mtx_unlock(&(_data)->mtx)
 static struct vtsock_softc	*vtsock_softc = NULL;
 volatile static u_int		active_sockets = 0;
 
@@ -134,7 +136,7 @@ static void	vtsock_input(struct mbuf *m);
 static int	vtsock_send(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enum vsock_ops op, struct mbuf *m);
 static int	vtsock_send_control(struct vsock_addr *src, struct vsock_addr *dst, int op, struct virtio_socket_data *private);
 static int	vtsock_output(struct mbuf *m);
-static void	vtsock_post_receive(struct vsock_pcb *pcb);
+static void	vtsock_post_receive(struct vsock_pcb *pcb, uint32_t received);
 static uint32_t	vtsock_check_writable(struct vsock_pcb *pcb, bool notify);
 static int	vtsock_attach_socket(struct vsock_pcb *pcb);
 static void	vtsock_detach_socket(struct vsock_pcb *pcb);
@@ -169,12 +171,12 @@ static driver_t vtsock_driver = {
 };
 
 static struct vsock_transport_ops transport = {
-	.get_local_cid = vtsock_get_local_cid,
-	.send_message = vtsock_send,
-	.post_receive = vtsock_post_receive,
-	.check_writable = vtsock_check_writable,
-	.attach_socket = vtsock_attach_socket,
-	.detach_socket = vtsock_detach_socket,
+	.get_local_cid	= vtsock_get_local_cid,
+	.send_message	= vtsock_send,
+	.post_receive	= vtsock_post_receive,
+	.check_writable	= vtsock_check_writable,
+	.attach_socket	= vtsock_attach_socket,
+	.detach_socket	= vtsock_detach_socket,
 };
 
 VIRTIO_SIMPLE_PNPINFO(virtio_socket, VIRTIO_ID_VSOCK,
@@ -459,8 +461,11 @@ vtsock_detach(device_t dev)
 	// Do not detach if there are active sockets
 	if (refcount_load(&active_sockets) > 0) {
 		vsock_transport_unlock();
-		return EBUSY;
+		return (EBUSY);
 	}
+
+	vsock_transport_deregister();
+	vsock_transport_unlock();
 
 	sc = device_get_softc(dev);
 
@@ -523,10 +528,6 @@ vtsock_detach(device_t dev)
 	mtx_destroy(&sc->vtsock_mtx);
 	mtx_destroy(&txq->vtstx_mtx);
 	cv_destroy(&txq->vtstx_cv);
-
-	vsock_transport_deregister();
-
-	vsock_transport_unlock();
 
 	return (0);
 }
@@ -594,7 +595,6 @@ vtsock_send(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enu
 {
 	struct virtio_vtsock_hdr *hdr;
 	struct virtio_socket_data *private = transport;
-	struct vsock_pcb *pcb = private->so->so_pcb;
 	uint32_t buf_alloc, fwd_cnt, len;
 	int error;
 	int flags = 0;
@@ -615,7 +615,7 @@ vtsock_send(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enu
 		len = 0;
 	}
 
-	fwd_cnt = pcb->fwd_cnt;
+	fwd_cnt = private->fwd_cnt;
 	SOCK_RECVBUF_LOCK(private->so);
 	buf_alloc = private->so->so_rcv.sb_hiwat;
 	SOCK_RECVBUF_UNLOCK(private->so);
@@ -703,14 +703,12 @@ static int
 vtsock_send_control(struct vsock_addr *src, struct vsock_addr *dst, int op, struct virtio_socket_data *private)
 {
 	struct mbuf *m;
-	struct vsock_pcb *pcb = NULL;
 	struct virtio_vtsock_hdr *hdr;
 	uint32_t fwd_cnt = 0;
 	uint32_t buf_alloc = 0;
 
 	if (private != NULL) {
-		pcb = private->so->so_pcb;
-		fwd_cnt = pcb->fwd_cnt;
+		fwd_cnt = private->fwd_cnt;
 		SOCK_RECVBUF_LOCK(private->so);
 		buf_alloc = private->so->so_rcv.sb_hiwat;
 		SOCK_RECVBUF_UNLOCK(private->so);
@@ -770,7 +768,15 @@ again:
 static void
 vtsock_event_intr(void *ctx)
 {
-	// TODO: not implemented yet
+	/* TODO: not implemented yet
+	 * The one event defined is VIRTIO_VSOCK_EVENT_TRANSPORT_RESET
+	 * It happens when the communication is interrupted. Usually when
+	 * the guest is migrated to another host.
+	 * In this case all the connected sockets MUST be disconnected
+	 * and the CID MUST be read again.
+	 * Listen sockets MUST be preserved but need to have their CID updated
+	 * if they are bound to the guest CID
+	 */
 	struct vtsock_eventq *q = ctx;
 	struct sglist *sg = q->vtsevent_sg;
 	struct mbuf *m;
@@ -927,11 +933,11 @@ vtsock_input(struct mbuf *m)
 		newpcb->remote.port = remote.port;
 		newpcb->remote.cid = remote.cid;
 		newpcb->ops = pcb->ops;
-		newpcb->fwd_cnt = 0;
 
 		newprivate = newpcb->transport;
 		newprivate->peer_buf_alloc = private->peer_buf_alloc;
 		newprivate->peer_fwd_cnt = private->peer_fwd_cnt;
+		newprivate->fwd_cnt = 0;
 
 		soisconnected(newso);
 		vsock_pcb_insert_connected(newpcb);
@@ -974,7 +980,7 @@ vtsock_input(struct mbuf *m)
 	case VIRTIO_VTSOCK_OP_RW:
 		m_len = m_length(m, NULL) - sizeof(*hdr);
 
-		if (hdr->len <= 0) {
+		if (hdr->len == 0) {
 			goto out;
 		}
 
@@ -1010,15 +1016,19 @@ out:
 }
 
 static void
-vtsock_post_receive(struct vsock_pcb *pcb)
+vtsock_post_receive(struct vsock_pcb *pcb, uint32_t received)
 {
 	struct virtio_socket_data *private = pcb->transport;
+
+	PRIVATE_LOCK(private);
+	private->fwd_cnt += received;
+	PRIVATE_UNLOCK(private);
 
 	/*
 	* If the peer's view of our credit is below a threshold (VTSOCK_BUFSZ << 2 here)
 	* send a credit update proactively.
 	*/
-	if ((pcb->fwd_cnt - private->last_fwd_cnt + (VTSOCK_BUFSZ << 2) ) >= private->last_buf_alloc) {
+	if ((private->fwd_cnt - private->last_fwd_cnt + (VTSOCK_BUFSZ << 2) ) >= private->last_buf_alloc) {
 		vtsock_send(private, &pcb->local, &pcb->remote, VSOCK_CREDIT_UPDATE, NULL);
 	}
 }
@@ -1081,6 +1091,7 @@ vtsock_attach_socket(struct vsock_pcb *pcb)
 	private->last_buf_alloc = VSOCK_RCV_BUFFER_SIZE;
 
 	pcb->transport = private;
+	mtx_init(&private->mtx, "virtio_socket_data_mtx", NULL, MTX_DEF);
 	refcount_acquire(&active_sockets);
 
 	return (0);
@@ -1089,7 +1100,11 @@ vtsock_attach_socket(struct vsock_pcb *pcb)
 static void
 vtsock_detach_socket(struct vsock_pcb *pcb)
 {
+	struct virtio_socket_data *private = pcb->transport;
+
+	mtx_destroy(&private->mtx);
 	free(pcb->transport, M_VTSOCK);
+	pcb->transport = NULL;
 	refcount_release(&active_sockets);
 }
 
