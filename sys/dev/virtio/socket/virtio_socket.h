@@ -63,8 +63,8 @@ struct virtio_socket_data {
 };
 
 /* Features */
-#define VIRTIO_VTSOCK_F_STREAM		0x1
-#define VIRTIO_VTSOCK_F_SEQPACKET	0x2
+#define VIRTIO_VTSOCK_F_STREAM		0
+#define VIRTIO_VTSOCK_F_SEQPACKET	1
 
 /* Operations */
 #define VIRTIO_VTSOCK_OP_INVALID	0
