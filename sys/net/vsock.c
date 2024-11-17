@@ -536,9 +536,7 @@ vsock_sosend(struct socket *so, struct sockaddr *addr, struct uio *uio,
 		writable = pcb->ops->check_writable(pcb, FALSE);
 
 		if (writable == 0) {
-			// TODO: need to check_writable(pcb, TRUE) here too but
-			// with nonblocking sockets it can happen all the time so need to
-			// find a way to control the amount of calls...
+			// XXX: should call check_writable(pcb, TRUE) from here too?
 			if (so->so_state & SS_NBIO) {
 				error = EWOULDBLOCK;
 				SOCK_SENDBUF_UNLOCK(so);
@@ -574,7 +572,6 @@ vsock_sosend(struct socket *so, struct sockaddr *addr, struct uio *uio,
 		top = NULL;
 
 	} while (resid);
-
 
 out:
 	if (top != NULL)
@@ -721,7 +718,7 @@ vsock_shutdown(struct socket *so, enum shutdown_how how)
 	return (pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, op, NULL));
 }
 
-int
+static int
 vsock_control(struct socket *so, u_long cmd, void *data, struct ifnet *ifp,
 	      struct thread *td)
 {
@@ -750,7 +747,7 @@ out:
 	return (error);
 }
 
-struct vsock_pcb *
+static struct vsock_pcb *
 vsock_pcballoc(void)
 {
 	struct vsock_pcb *pcb;
@@ -765,7 +762,7 @@ vsock_pcballoc(void)
 	return (pcb);
 }
 
-void
+static void
 vsock_pcbfree(struct vsock_pcb *pcb)
 {
 	mtx_destroy(&pcb->mtx);
@@ -797,4 +794,5 @@ vsock_transport_deregister(void)
 *   - User credential validation
 *   - Deny ports < 1024 to non-root
 * - Loopback?
+* - VNET?
 */
