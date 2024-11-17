@@ -112,6 +112,7 @@ SDT_PROVIDER_DEFINE(vtsock);
 SDT_PROBE_DEFINE1(vtsock, , , receive, "struct virtio_vsock_hdr *");
 SDT_PROBE_DEFINE1(vtsock, , , send, "struct virtio_vsock_hdr *");
 
+static int	vtsock_modevent(module_t mod, int type, void *unused);
 static int	vtsock_probe(device_t dev);
 static int	vtsock_attach(device_t dev);
 static int	vtsock_detach(device_t dev);
@@ -145,6 +146,8 @@ static void	vtsock_setup_header(struct virtio_vtsock_hdr *hdr, struct vsock_addr
 		    uint32_t buf_alloc, uint32_t fwd_cnt);
 static uint32_t	vtsock_get_peer_credit(struct virtio_socket_data *private);
 static uint64_t	vtsock_get_local_cid(void);
+
+#define	VTSOCK_FEATURES	VIRTIO_VTSOCK_F_STREAM
 
 static struct virtio_feature_desc vtsock_feature_desc[] = {
 	{ VIRTIO_VTSOCK_F_STREAM,	"StreamSocket"	},
@@ -182,6 +185,11 @@ static struct vsock_transport_ops transport = {
 VIRTIO_SIMPLE_PNPINFO(virtio_socket, VIRTIO_ID_VSOCK,
     "VirtIO VSOCK Transport Adapter");
 
+VIRTIO_DRIVER_MODULE(virtio_socket, vtsock_driver, vtsock_modevent, NULL);
+MODULE_VERSION(virtio_socket, 1);
+MODULE_DEPEND(virtio_socket, virtio, 1, 1, 1);
+MODULE_DEPEND(virtio_socket, vsock, 1, 1, 1);
+
 static int
 vtsock_modevent(module_t mod, int type, void *unused)
 {
@@ -189,14 +197,8 @@ vtsock_modevent(module_t mod, int type, void *unused)
 
 	switch (type) {
 	case MOD_LOAD:
-		error = 0;
-		break;
 	case MOD_QUIESCE:
-		error = 0;
-		break;
 	case MOD_UNLOAD:
-		error = 0;
-		break;
 	case MOD_SHUTDOWN:
 		error = 0;
 		break;
@@ -208,132 +210,10 @@ vtsock_modevent(module_t mod, int type, void *unused)
 	return (error);
 }
 
-VIRTIO_DRIVER_MODULE(virtio_socket, vtsock_driver, vtsock_modevent, NULL);
-MODULE_VERSION(virtio_socket, 1);
-MODULE_DEPEND(virtio_socket, virtio, 1, 1, 1);
-MODULE_DEPEND(virtio_socket, vsock, 1, 1, 1);
-
 static int
 vtsock_probe(device_t dev)
 {
 	return (VIRTIO_SIMPLE_PROBE(dev, virtio_socket));
-}
-
-static int
-vtsock_enqueue_rxvq_mbuf(struct vtsock_rxq *rxq, struct mbuf *m)
-{
-	int error;
-
-	struct sglist *sg = rxq->vtsrx_sg;
-
-	sglist_reset(sg);
-	error = sglist_append_mbuf(sg, m);
-	if (error != 0) {
-		return (error);
-	}
-
-	return (virtqueue_enqueue(rxq->vtsrx_vq, m, sg, 0, sg->sg_nseg));
-}
-
-static int
-vtsock_populate_rxvq(struct vtsock_rxq *rxq)
-{
-	struct virtqueue *vq = rxq->vtsrx_vq;
-	struct mbuf *m;
-	int nbufs, error;
-
-	error = 0;
-
-	for (nbufs = 0; !virtqueue_full(vq); nbufs++) {
-		m = m_get3(VTSOCK_BUFSZ, M_NOWAIT, MT_DATA, 0);
-		if (m == NULL) {
-			return (ENOBUFS);
-		}
-		m->m_len = VTSOCK_BUFSZ;
-		error = vtsock_enqueue_rxvq_mbuf(rxq, m);
-		if (error) {
-			return (error);
-		}
-	}
-
-	if (nbufs > 0) {
-		virtqueue_notify(vq);
-	}
-
-	return (error);
-}
-
-static int
-vtsock_populate_eventvq(struct vtsock_eventq *eventq)
-{
-	struct virtqueue *vq = eventq->vtsevent_vq;
-	struct mbuf *m;
-	int error;
-
-	// Enqueue a single mbuf to the event virtqueue
-
-	m = m_get2(sizeof(struct virtio_vtsock_event), M_NOWAIT, MT_DATA, 0);
-	if (m == NULL) {
-		return (ENOBUFS);
-	}
-	m->m_len = sizeof(struct virtio_vtsock_event);
-
-	struct sglist *sg = eventq->vtsevent_sg;
-	sglist_reset(sg);
-	error = sglist_append_single_mbuf(sg, m);
-	if (error != 0) {
-		return (error);
-	}
-
-	error = virtqueue_enqueue(vq, m, sg, 0, sg->sg_nseg);
-	if (error) {
-		return (error);
-	}
-
-	virtqueue_notify(vq);
-
-	return (error);
-}
-
-
-static int
-vtsock_setup_taskqueues(struct vtsock_softc *sc)
-{
-	struct vtsock_rxq *rxq = &sc->vtsock_rxq;
-	struct vtsock_txq *txq = &sc->vtsock_txq;
-	device_t dev = sc->vtsock_dev;
-	int error;
-
-	TASK_INIT(&rxq->vtsock_intrtask, 0, vtsock_rx_task, rxq);
-	TASK_INIT(&txq->vtsock_intrtask, 0, vtsock_tx_task, txq);
-
-	rxq->vtsock_rxq = taskqueue_create("virtio_socket RX", M_NOWAIT, taskqueue_thread_enqueue, &rxq->vtsock_rxq);
-	if (rxq->vtsock_rxq == NULL) {
-		device_printf(dev, "RX taskqueue_create failed\n");
-		error = ENOMEM;
-		goto out;
-	}
-
-	error = taskqueue_start_threads(&rxq->vtsock_rxq, 1, PI_NET, "%s rxq", device_get_nameunit(dev));
-	if (error) {
-		device_printf(dev, "failed to start RX taskqueue: %d\n", error);
-		goto out;
-	}
-
-	txq->vtsock_txq = taskqueue_create("virtio_socket TX", M_NOWAIT, taskqueue_thread_enqueue, &txq->vtsock_txq);
-	if (txq->vtsock_txq == NULL) {
-		device_printf(dev, "TX taskqueue_create failed\n");
-		error = ENOMEM;
-		goto out;
-	}
-
-	error = taskqueue_start_threads(&txq->vtsock_txq, 1, PI_NET, "%s txq", device_get_nameunit(dev));
-	if (error) {
-		device_printf(dev, "failed to start TX taskqueue: %d\n", error);
-	}
-
-out:
-	return (error);
 }
 
 static int
@@ -525,6 +405,8 @@ vtsock_detach(device_t dev)
 		buf_ring_free(txq->vtstx_br, M_DEVBUF);
 	}
 
+	vtsock_softc = NULL;
+
 	mtx_destroy(&sc->vtsock_mtx);
 	mtx_destroy(&txq->vtstx_mtx);
 	cv_destroy(&txq->vtstx_cv);
@@ -540,6 +422,122 @@ vtsock_read_config(struct vtsock_softc *sc, struct virtio_vtsock_config *cfg)
 	virtio_read_device_config(dev,
 	    offsetof(struct virtio_vtsock_config, guest_cid),
 	    &cfg->guest_cid, sizeof(cfg->guest_cid));
+}
+
+static int
+vtsock_enqueue_rxvq_mbuf(struct vtsock_rxq *rxq, struct mbuf *m)
+{
+	int error;
+
+	struct sglist *sg = rxq->vtsrx_sg;
+
+	sglist_reset(sg);
+	error = sglist_append_mbuf(sg, m);
+	if (error != 0) {
+		return (error);
+	}
+
+	return (virtqueue_enqueue(rxq->vtsrx_vq, m, sg, 0, sg->sg_nseg));
+}
+
+static int
+vtsock_populate_rxvq(struct vtsock_rxq *rxq)
+{
+	struct virtqueue *vq = rxq->vtsrx_vq;
+	struct mbuf *m;
+	int nbufs, error;
+
+	error = 0;
+
+	for (nbufs = 0; !virtqueue_full(vq); nbufs++) {
+		m = m_get3(VTSOCK_BUFSZ, M_NOWAIT, MT_DATA, 0);
+		if (m == NULL) {
+			return (ENOBUFS);
+		}
+		m->m_len = VTSOCK_BUFSZ;
+		error = vtsock_enqueue_rxvq_mbuf(rxq, m);
+		if (error) {
+			return (error);
+		}
+	}
+
+	if (nbufs > 0) {
+		virtqueue_notify(vq);
+	}
+
+	return (error);
+}
+
+static int
+vtsock_populate_eventvq(struct vtsock_eventq *eventq)
+{
+	struct virtqueue *vq = eventq->vtsevent_vq;
+	struct mbuf *m;
+	int error;
+
+	// Enqueue a single mbuf to the event virtqueue
+
+	m = m_get2(sizeof(struct virtio_vtsock_event), M_NOWAIT, MT_DATA, 0);
+	if (m == NULL) {
+		return (ENOBUFS);
+	}
+	m->m_len = sizeof(struct virtio_vtsock_event);
+
+	struct sglist *sg = eventq->vtsevent_sg;
+	sglist_reset(sg);
+	error = sglist_append_single_mbuf(sg, m);
+	if (error != 0) {
+		return (error);
+	}
+
+	error = virtqueue_enqueue(vq, m, sg, 0, sg->sg_nseg);
+	if (error) {
+		return (error);
+	}
+
+	virtqueue_notify(vq);
+
+	return (error);
+}
+
+static int
+vtsock_setup_taskqueues(struct vtsock_softc *sc)
+{
+	struct vtsock_rxq *rxq = &sc->vtsock_rxq;
+	struct vtsock_txq *txq = &sc->vtsock_txq;
+	device_t dev = sc->vtsock_dev;
+	int error;
+
+	TASK_INIT(&rxq->vtsock_intrtask, 0, vtsock_rx_task, rxq);
+	TASK_INIT(&txq->vtsock_intrtask, 0, vtsock_tx_task, txq);
+
+	rxq->vtsock_rxq = taskqueue_create("virtio_socket RX", M_NOWAIT, taskqueue_thread_enqueue, &rxq->vtsock_rxq);
+	if (rxq->vtsock_rxq == NULL) {
+		device_printf(dev, "RX taskqueue_create failed\n");
+		error = ENOMEM;
+		goto out;
+	}
+
+	error = taskqueue_start_threads(&rxq->vtsock_rxq, 1, PI_NET, "%s rxq", device_get_nameunit(dev));
+	if (error) {
+		device_printf(dev, "failed to start RX taskqueue: %d\n", error);
+		goto out;
+	}
+
+	txq->vtsock_txq = taskqueue_create("virtio_socket TX", M_NOWAIT, taskqueue_thread_enqueue, &txq->vtsock_txq);
+	if (txq->vtsock_txq == NULL) {
+		device_printf(dev, "TX taskqueue_create failed\n");
+		error = ENOMEM;
+		goto out;
+	}
+
+	error = taskqueue_start_threads(&txq->vtsock_txq, 1, PI_NET, "%s txq", device_get_nameunit(dev));
+	if (error) {
+		device_printf(dev, "failed to start TX taskqueue: %d\n", error);
+	}
+
+out:
+	return (error);
 }
 
 static uint64_t
@@ -584,7 +582,7 @@ static int
 vtsock_setup_features(struct vtsock_softc *sc)
 {
 	device_t dev = sc->vtsock_dev;
-	uint64_t features = VIRTIO_VTSOCK_F_STREAM;
+	uint64_t features = VTSOCK_FEATURES;
 
 	sc->vtsock_features = virtio_negotiate_features(dev, features);
 	return (virtio_finalize_features(dev));
