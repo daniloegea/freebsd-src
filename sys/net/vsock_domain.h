@@ -32,6 +32,7 @@
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <sys/queue.h>
+#include <sys/ck.h>
 
 #define	VSOCK_RCV_BUFFER_SIZE	(256 * 1024)
 #define	VSOCK_MAX_MSG_SIZE	(64 * 1024)
@@ -42,6 +43,7 @@ struct vsock_addr {
 };
 
 struct vsock_pcb {
+	CK_LIST_ENTRY(vsock_pcb)	next;
 	struct socket			*so;
 	struct vsock_addr		local;
 	struct vsock_addr		remote;
@@ -50,8 +52,6 @@ struct vsock_pcb {
 
 	/* Transport private data */
 	void				*transport;
-
-	LIST_ENTRY(vsock_pcb)		next;
 };
 
 
