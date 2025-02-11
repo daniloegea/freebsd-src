@@ -69,9 +69,9 @@
 MALLOC_DEFINE(M_VSOCK, "vsock", "AF_VSOCK data");
 
 static struct rwlock 		vsock_pcbs_connected_rwlock;
-static LIST_HEAD(, vsock_pcb)	vsock_pcbs_connected = LIST_HEAD_INITIALIZER(vsock_pcbs_connected);
+static CK_LIST_HEAD(, vsock_pcb)	vsock_pcbs_connected = CK_LIST_HEAD_INITIALIZER(vsock_pcbs_connected);
 static struct rwlock 		vsock_pcbs_bound_rwlock;
-static LIST_HEAD(, vsock_pcb)	vsock_pcbs_bound = LIST_HEAD_INITIALIZER(vsock_pcbs_bound);
+static CK_LIST_HEAD(, vsock_pcb)	vsock_pcbs_bound = CK_LIST_HEAD_INITIALIZER(vsock_pcbs_bound);
 
 static struct vsock_transport_ops	*vsock_transport = NULL;
 static struct mtx 			vsock_transport_mtx;
@@ -163,9 +163,9 @@ static void
 vsock_init(void *arg __unused)
 {
 	rw_init(&vsock_pcbs_connected_rwlock, "vsock_pcbs_connected_rwlock");
-	LIST_INIT(&vsock_pcbs_connected);
+	CK_LIST_INIT(&vsock_pcbs_connected);
 	rw_init(&vsock_pcbs_bound_rwlock, "vsock_pcbs_bound_rwlock");
-	LIST_INIT(&vsock_pcbs_bound);
+	CK_LIST_INIT(&vsock_pcbs_bound);
 	mtx_init(&vsock_transport_mtx,
 		  "vsock_transport_mtx", NULL, MTX_DEF);
 	sx_init(&vsock_transport_sx, "vsock_transport_sx");
@@ -177,7 +177,7 @@ void
 vsock_pcb_insert_connected(struct vsock_pcb *pcb)
 {
 	rw_wlock(&vsock_pcbs_connected_rwlock);
-	LIST_INSERT_HEAD(&vsock_pcbs_connected, pcb, next);
+	CK_LIST_INSERT_HEAD(&vsock_pcbs_connected, pcb, next);
 	rw_wunlock(&vsock_pcbs_connected_rwlock);
 }
 
@@ -187,9 +187,9 @@ vsock_pcb_remove_connected(struct vsock_pcb *pcb)
 	struct vsock_pcb *p;
 
 	rw_wlock(&vsock_pcbs_connected_rwlock);
-	LIST_FOREACH(p, &vsock_pcbs_connected, next)
+	CK_LIST_FOREACH(p, &vsock_pcbs_connected, next)
 	if (p == pcb) {
-		LIST_REMOVE(pcb, next);
+		CK_LIST_REMOVE(pcb, next);
 		rw_wunlock(&vsock_pcbs_connected_rwlock);
 		return;
 	}
@@ -200,7 +200,7 @@ void
 vsock_pcb_insert_bound(struct vsock_pcb *pcb)
 {
 	rw_wlock(&vsock_pcbs_bound_rwlock);
-	LIST_INSERT_HEAD(&vsock_pcbs_bound, pcb, next);
+	CK_LIST_INSERT_HEAD(&vsock_pcbs_bound, pcb, next);
 	rw_wunlock(&vsock_pcbs_bound_rwlock);
 }
 
@@ -210,9 +210,9 @@ vsock_pcb_remove_bound(struct vsock_pcb *pcb)
 	struct vsock_pcb *p;
 
 	rw_wlock(&vsock_pcbs_bound_rwlock);
-	LIST_FOREACH(p, &vsock_pcbs_bound, next)
+	CK_LIST_FOREACH(p, &vsock_pcbs_bound, next)
 	if (p == pcb) {
-		LIST_REMOVE(pcb, next);
+		CK_LIST_REMOVE(pcb, next);
 		rw_wunlock(&vsock_pcbs_bound_rwlock);
 		return;
 	}
@@ -225,7 +225,7 @@ vsock_pcb_lookup_connected(struct vsock_addr *local_addr, struct vsock_addr *rem
 	struct vsock_pcb *pcb = NULL;
 
 	rw_rlock(&vsock_pcbs_connected_rwlock);
-	LIST_FOREACH(pcb, &vsock_pcbs_connected, next)
+	CK_LIST_FOREACH(pcb, &vsock_pcbs_connected, next)
 	if (pcb->so &&
 		local_addr->port == pcb->local.port &&
 		remote_addr->port == pcb->remote.port &&
@@ -244,7 +244,7 @@ vsock_pcb_lookup_bound(struct vsock_addr *addr)
 	struct vsock_pcb *pcb = NULL;
 
 	rw_rlock(&vsock_pcbs_bound_rwlock);
-	LIST_FOREACH(pcb, &vsock_pcbs_bound, next)
+	CK_LIST_FOREACH(pcb, &vsock_pcbs_bound, next)
 	if (pcb->so &&
 		addr->port == pcb->local.port &&
 		(addr->cid == pcb->local.cid || pcb->local.cid == VMADDR_CID_ANY)) {
