@@ -47,8 +47,8 @@ enum vsock_ops {
 	VSOCK_CREDIT_REQUEST
 };
 
-#define VSOCK_LOCK(vpcb) mtx_lock(&(vpcb)->mtx)
-#define VSOCK_UNLOCK(vpcb) mtx_unlock(&(vpcb)->mtx)
+#define VSOCK_LOCK(vpcb) sx_xlock(&(vpcb)->sx)
+#define VSOCK_UNLOCK(vpcb) sx_xunlock(&(vpcb)->sx)
 
 struct vsock_transport_ops {
 	uint64_t (*get_local_cid)(void);
