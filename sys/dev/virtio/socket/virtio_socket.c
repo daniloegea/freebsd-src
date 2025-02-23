@@ -341,6 +341,7 @@ vtsock_detach(device_t dev)
 	// Do not detach if there are active sockets
 	if (refcount_load(&active_sockets) > 0) {
 		vsock_transport_unlock();
+		device_printf(dev, "Cannot unload module with open sockets.");
 		return (EBUSY);
 	}
 
@@ -806,7 +807,6 @@ vtsock_rx_task(void *ctx, int pending __unused)
 	int deq;
 	int error;
 
-	vsock_transport_lock();
 again:
 
 	deq = 0;
@@ -835,8 +835,6 @@ again:
 		// There are more buffers ready in the queue
                 goto again;
         }
-
-	vsock_transport_unlock();
 }
 
 static void
@@ -879,6 +877,7 @@ vtsock_input(struct mbuf *m)
 	struct virtio_socket_data *private, *newprivate;
 	struct vsock_pcb *pcb, *newpcb;
 	struct socket *so, *newso;
+	struct epoch_tracker et;
 	u_int m_len;
 
 	hdr = mtod(m, struct virtio_vtsock_hdr *);
@@ -900,6 +899,14 @@ vtsock_input(struct mbuf *m)
 	}
 
 	if (pcb == NULL) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		goto out_error;
+	}
+
+	NET_EPOCH_ENTER(et);
+	VSOCK_LOCK(pcb);
+
+	if (pcb->so == NULL) {
 		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
 		goto out;
 	}
@@ -1008,6 +1015,9 @@ vtsock_input(struct mbuf *m)
 	}
 
 out:
+	VSOCK_UNLOCK(pcb);
+	NET_EPOCH_EXIT(et);
+out_error:
 	if (m) {
 		m_freem(m);
 	}
