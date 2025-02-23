@@ -68,9 +68,9 @@
 
 MALLOC_DEFINE(M_VSOCK, "vsock", "AF_VSOCK data");
 
-static struct rwlock 		vsock_pcbs_connected_rwlock;
+static struct rwlock 			vsock_pcbs_connected_rwlock;
 static CK_LIST_HEAD(, vsock_pcb)	vsock_pcbs_connected = CK_LIST_HEAD_INITIALIZER(vsock_pcbs_connected);
-static struct rwlock 		vsock_pcbs_bound_rwlock;
+static struct rwlock 			vsock_pcbs_bound_rwlock;
 static CK_LIST_HEAD(, vsock_pcb)	vsock_pcbs_bound = CK_LIST_HEAD_INITIALIZER(vsock_pcbs_bound);
 
 static struct vsock_transport_ops	*vsock_transport = NULL;
@@ -264,21 +264,7 @@ vsock_attach(struct socket *so, int proto, struct thread *td)
 
 	SDT_PROBE1(vsock, , , create, so);
 
-	/* sonewconn() is called from the transport code when a new
-	 * connection is received. The transport will be locked while
-	 * a new packet is being processed and sonewconn() calls pr_attach()
-	 * with td == NULL. We use this trick here to differentiate when
-	 * pr_attach() is called from user space and from the transport.
-	 *
-	 * The transport lock is acquired here in order to prevent a race
-	 * when the number of active sockets is checked. We don't want
-	 * to unload the transport while there are sockets in use by
-	 * the vsock layer.
-	 *
-	 */
-	if (td != NULL) {
-		vsock_transport_lock();
-	}
+	vsock_transport_lock();
 
 	if (vsock_transport == NULL) {
 		error = ENXIO;
@@ -306,22 +292,29 @@ vsock_attach(struct socket *so, int proto, struct thread *td)
 	error = pcb->ops->attach_socket(pcb);
 
 out:
-	if (td != NULL) {
-		vsock_transport_unlock();
-	}
-
+	vsock_transport_unlock();
 	return (error);
+}
+
+static void
+vsock_pcb_destroy_cb(struct epoch_context *ctx)
+{
+	struct vsock_pcb *pcb;
+
+	pcb = __containerof(ctx, struct vsock_pcb, epoch_ctx);
+
+	vsock_pcbfree(pcb);
 }
 
 static void
 vsock_detach(struct socket *so)
 {
 	struct vsock_pcb *pcb;
+	struct epoch_tracker et;
 
 	SDT_PROBE1(vsock, , , destroy, so);
 
-	vsock_transport_lock();
-
+	NET_EPOCH_ENTER(et);
 	pcb = so2vsockpcb(so);
 
 	KASSERT(pcb != NULL, ("vsock_detach: pcb == NULL"));
@@ -331,10 +324,15 @@ vsock_detach(struct socket *so)
 
 	pcb->ops->detach_socket(pcb);
 
-	vsock_transport_unlock();
+	VSOCK_LOCK(pcb);
+	pcb->so = NULL;
+	VSOCK_UNLOCK(pcb);
 
-	vsock_pcbfree(pcb);
+	NET_EPOCH_EXIT(et);
+
 	so->so_pcb = NULL;
+
+	NET_EPOCH_CALL(vsock_pcb_destroy_cb, &pcb->epoch_ctx);
 }
 
 static int
@@ -757,7 +755,7 @@ vsock_pcballoc(void)
 		return (NULL);
 	}
 
-	mtx_init(&pcb->mtx, "vsock PCB mutex", NULL, MTX_DEF);
+	sx_init(&pcb->sx, "vsock PCB shared/exclusive lock");
 
 	return (pcb);
 }
@@ -765,7 +763,7 @@ vsock_pcballoc(void)
 static void
 vsock_pcbfree(struct vsock_pcb *pcb)
 {
-	mtx_destroy(&pcb->mtx);
+	sx_destroy(&pcb->sx);
 	free(pcb, M_VSOCK);
 }
 
