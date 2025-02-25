@@ -264,7 +264,22 @@ vsock_attach(struct socket *so, int proto, struct thread *td)
 
 	SDT_PROBE1(vsock, , , create, so);
 
-	vsock_transport_lock();
+	/* sonewconn() is called from the transport code when a new
+	 * connection is received. The transport will be inside a NET_EPOCH
+	 * while a new packet is being processed (so it can't sleep) and
+	 * sonewconn() calls pr_attach() with td == NULL. We use this trick
+	 * here to differentiate when pr_attach() is called from user space
+	 * and from the transport.
+	 *
+	 * The transport lock is acquired here so we can check reliably if
+	 * there are active sockets when the transport module is unloaded.
+	 * We don't want to unload the transport while there are sockets in use by
+	 * the vsock layer. We also don't want to create a new a new socket after the
+	 * transport being unloaded.
+	 */
+	if (td != NULL) {
+		vsock_transport_lock();
+	}
 
 	if (vsock_transport == NULL) {
 		error = ENXIO;
@@ -292,7 +307,9 @@ vsock_attach(struct socket *so, int proto, struct thread *td)
 	error = pcb->ops->attach_socket(pcb);
 
 out:
-	vsock_transport_unlock();
+	if (td != NULL) {
+		vsock_transport_unlock();
+	}
 	return (error);
 }
 
