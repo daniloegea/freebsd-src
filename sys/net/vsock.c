@@ -321,11 +321,9 @@ static void
 vsock_detach(struct socket *so)
 {
 	struct vsock_pcb *pcb;
-	struct epoch_tracker et;
 
 	SDT_PROBE1(vsock, , , destroy, so);
 
-	NET_EPOCH_ENTER(et);
 	pcb = so2vsockpcb(so);
 
 	KASSERT(pcb != NULL, ("vsock_detach: pcb == NULL"));
@@ -338,8 +336,6 @@ vsock_detach(struct socket *so)
 	VSOCK_LOCK(pcb);
 	pcb->so = NULL;
 	VSOCK_UNLOCK(pcb);
-
-	NET_EPOCH_EXIT(et);
 
 	so->so_pcb = NULL;
 
