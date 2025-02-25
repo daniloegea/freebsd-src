@@ -224,17 +224,14 @@ vsock_pcb_lookup_connected(struct vsock_addr *local_addr, struct vsock_addr *rem
 {
 	struct vsock_pcb *pcb = NULL;
 
-	rw_rlock(&vsock_pcbs_connected_rwlock);
 	CK_LIST_FOREACH(pcb, &vsock_pcbs_connected, next)
 	if (pcb->so &&
 		local_addr->port == pcb->local.port &&
 		remote_addr->port == pcb->remote.port &&
 		local_addr->cid == pcb->local.cid &&
 		remote_addr->cid == pcb->remote.cid) {
-		rw_runlock(&vsock_pcbs_connected_rwlock);
 		return (pcb);
 	}
-	rw_runlock(&vsock_pcbs_connected_rwlock);
 	return (pcb);
 }
 
@@ -243,15 +240,12 @@ vsock_pcb_lookup_bound(struct vsock_addr *addr)
 {
 	struct vsock_pcb *pcb = NULL;
 
-	rw_rlock(&vsock_pcbs_bound_rwlock);
 	CK_LIST_FOREACH(pcb, &vsock_pcbs_bound, next)
 	if (pcb->so &&
 		addr->port == pcb->local.port &&
 		(addr->cid == pcb->local.cid || pcb->local.cid == VMADDR_CID_ANY)) {
-		rw_runlock(&vsock_pcbs_bound_rwlock);
 		return (pcb);
 	}
-	rw_runlock(&vsock_pcbs_bound_rwlock);
 
 	return (pcb);
 }
