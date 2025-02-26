@@ -870,40 +870,181 @@ vtsock_tx_task(void *ctx, int pending __unused)
 }
 
 static void
-vtsock_input(struct mbuf *m)
+vtsock_populate_addr(struct virtio_vtsock_hdr *hdr, struct vsock_addr *remote, struct vsock_addr *local)
+{
+	remote->cid = hdr->src_cid;
+	remote->port = hdr->src_port;
+	local->cid = hdr->dst_cid;
+	local->port = hdr->dst_port;
+}
+
+static void
+vtsock_input_request(struct mbuf *m)
 {
 	struct vsock_addr remote, local;
 	struct virtio_vtsock_hdr *hdr;
-	struct virtio_socket_data *private, *newprivate;
 	struct vsock_pcb *pcb, *newpcb;
+	struct virtio_socket_data *private;
 	struct socket *so, *newso;
-	struct epoch_tracker et;
-	u_int m_len;
+
+	NET_EPOCH_ASSERT();
 
 	hdr = mtod(m, struct virtio_vtsock_hdr *);
+	vtsock_populate_addr(hdr, &remote, &local);
 
-	remote.cid = hdr->src_cid;
-	remote.port = hdr->src_port;
-	local.cid = hdr->dst_cid;
-	local.port = hdr->dst_port;
-
-	SDT_PROBE1(vtsock, , , receive, hdr);
-
-	switch (hdr->op) {
-	case VIRTIO_VTSOCK_OP_REQUEST:
-	case VIRTIO_VTSOCK_OP_RESPONSE:
-		pcb = vsock_pcb_lookup_bound(&local);
-		break;
-	default:
-		pcb = vsock_pcb_lookup_connected(&local, &remote);
-	}
+	pcb = vsock_pcb_lookup_bound(&local);
 
 	if (pcb == NULL) {
 		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
-		goto out_error;
+		return;
 	}
 
-	NET_EPOCH_ENTER(et);
+	VSOCK_LOCK(pcb);
+
+	if (pcb->so == NULL) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		goto out;
+	}
+
+	so = pcb->so;
+
+	if (!SOLISTENING(so)) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		goto out;
+	}
+
+	CURVNET_SET(so->so_vnet);
+	newso = sonewconn(so, 0);
+	CURVNET_RESTORE();
+
+	if (newso == NULL) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		goto out;
+	}
+
+	newpcb = newso->so_pcb;
+	newpcb->local.port = local.port;
+	newpcb->local.cid = vtsock_get_local_cid();
+	newpcb->remote.port = remote.port;
+	newpcb->remote.cid = remote.cid;
+
+	private = newpcb->transport;
+	private->peer_buf_alloc = hdr->buf_alloc;
+	private->peer_fwd_cnt = hdr->fwd_cnt;
+	private->fwd_cnt = 0;
+
+	soisconnected(newso);
+	vsock_pcb_insert_connected(newpcb);
+
+	vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RESPONSE, private);
+
+out:
+	VSOCK_UNLOCK(pcb);
+}
+
+static void
+vtsock_input_response(struct mbuf *m)
+{
+	struct vsock_addr remote, local;
+	struct virtio_vtsock_hdr *hdr;
+	struct vsock_pcb *pcb;
+	struct socket *so;
+
+	NET_EPOCH_ASSERT();
+
+	hdr = mtod(m, struct virtio_vtsock_hdr *);
+	vtsock_populate_addr(hdr, &remote, &local);
+
+	pcb = vsock_pcb_lookup_bound(&local);
+
+	if (pcb == NULL) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		return;
+	}
+
+	VSOCK_LOCK(pcb);
+
+	if (pcb->so == NULL) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		goto out;
+	}
+
+	so = pcb->so;
+
+	if (so->so_state & SS_ISCONNECTING) {
+		vsock_pcb_remove_bound(pcb);
+		vsock_pcb_insert_connected(pcb);
+		soisconnected(so);
+	} else {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+	}
+
+out:
+	VSOCK_UNLOCK(pcb);
+}
+
+static void
+vtsock_input_reset(struct mbuf *m)
+{
+	struct vsock_addr remote, local;
+	struct virtio_vtsock_hdr *hdr;
+	struct vsock_pcb *pcb;
+	struct socket *so;
+
+	NET_EPOCH_ASSERT();
+
+	hdr = mtod(m, struct virtio_vtsock_hdr *);
+	vtsock_populate_addr(hdr, &remote, &local);
+
+	pcb = vsock_pcb_lookup_connected(&local, &remote);
+
+	if (pcb == NULL) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		return;
+	}
+
+	VSOCK_LOCK(pcb);
+
+	if (pcb->so == NULL) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		goto out;
+	}
+
+	so = pcb->so;
+
+	if (so->so_state & SS_ISDISCONNECTING) {
+		soisdisconnected(so);
+	} else if (so->so_state & SS_ISCONNECTING) {
+		so->so_error = ECONNREFUSED;
+		soisdisconnected(so);
+	}
+
+out:
+	VSOCK_UNLOCK(pcb);
+}
+
+static void
+vtsock_input_shutdown(struct mbuf *m)
+{
+	struct vsock_addr remote, local;
+	struct virtio_vtsock_hdr *hdr;
+	struct virtio_socket_data *private;
+	struct vsock_pcb *pcb;
+	struct socket *so;
+
+	NET_EPOCH_ASSERT();
+
+	hdr = mtod(m, struct virtio_vtsock_hdr *);
+	vtsock_populate_addr(hdr, &remote, &local);
+
+
+	pcb = vsock_pcb_lookup_connected(&local, &remote);
+
+	if (pcb == NULL) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		return;
+	}
+
 	VSOCK_LOCK(pcb);
 
 	if (pcb->so == NULL) {
@@ -916,108 +1057,200 @@ vtsock_input(struct mbuf *m)
 	private->peer_fwd_cnt = hdr->fwd_cnt;
 	private->peer_buf_alloc = hdr->buf_alloc;
 
+	vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, private);
+	vsock_pcb_remove_connected(pcb);
+	soisdisconnected(so);
+	sowwakeup(so);
+
+out:
+	VSOCK_UNLOCK(pcb);
+}
+
+static void
+vtsock_input_credit_update(struct mbuf *m)
+{
+	struct vsock_addr remote, local;
+	struct virtio_vtsock_hdr *hdr;
+	struct virtio_socket_data *private;
+	struct vsock_pcb *pcb;
+
+	NET_EPOCH_ASSERT();
+
+	hdr = mtod(m, struct virtio_vtsock_hdr *);
+	vtsock_populate_addr(hdr, &remote, &local);
+
+	pcb = vsock_pcb_lookup_connected(&local, &remote);
+
+	if (pcb == NULL) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		return;
+	}
+
+	VSOCK_LOCK(pcb);
+
+	if (pcb->so == NULL) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		goto out;
+	}
+
+	private = pcb->transport;
+	private->peer_fwd_cnt = hdr->fwd_cnt;
+	private->peer_buf_alloc = hdr->buf_alloc;
+
+	// Don't wake the sender thread up if the credit is still zero
+	if (vtsock_get_peer_credit(private) > 0) {
+		sowwakeup(private->so);
+	}
+
+out:
+	VSOCK_UNLOCK(pcb);
+}
+
+static void
+vtsock_input_credit_request(struct mbuf *m)
+{
+	struct vsock_addr remote, local;
+	struct virtio_vtsock_hdr *hdr;
+	struct virtio_socket_data *private;
+	struct vsock_pcb *pcb;
+
+	NET_EPOCH_ASSERT();
+
+	hdr = mtod(m, struct virtio_vtsock_hdr *);
+	vtsock_populate_addr(hdr, &remote, &local);
+
+	pcb = vsock_pcb_lookup_connected(&local, &remote);
+
+	if (pcb == NULL) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		return;
+	}
+
+	VSOCK_LOCK(pcb);
+
+	if (pcb->so == NULL) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		goto out;
+	}
+
+	private = pcb->transport;
+	private->peer_fwd_cnt = hdr->fwd_cnt;
+	private->peer_buf_alloc = hdr->buf_alloc;
+
+	vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_CREDIT_UPDATE, private);
+
+out:
+	VSOCK_UNLOCK(pcb);
+}
+
+static void
+vtsock_input_data(struct mbuf *m)
+{
+	struct vsock_addr remote, local;
+	struct virtio_vtsock_hdr *hdr;
+	struct virtio_socket_data *private;
+	struct vsock_pcb *pcb;
+	struct socket *so;
+	u_int m_len;
+
+	NET_EPOCH_ASSERT();
+
+	hdr = mtod(m, struct virtio_vtsock_hdr *);
+	vtsock_populate_addr(hdr, &remote, &local);
+
+
+	pcb = vsock_pcb_lookup_connected(&local, &remote);
+
+	if (pcb == NULL) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		return;
+	}
+
+	VSOCK_LOCK(pcb);
+
+	if (pcb->so == NULL) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		goto out;
+	}
+
+	so = pcb->so;
+	private = pcb->transport;
+	private->peer_fwd_cnt = hdr->fwd_cnt;
+	private->peer_buf_alloc = hdr->buf_alloc;
+
+	m_len = m_length(m, NULL) - sizeof(*hdr);
+
+	if (hdr->len == 0) {
+		goto out;
+	}
+
+	if (m_len != hdr->len) {
+		goto out;
+	}
+
+	if ((so->so_state & SS_ISCONNECTED) == 0) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		goto out;
+	}
+
+	m_adj(m, sizeof(struct virtio_vtsock_hdr));
+	SOCK_RECVBUF_LOCK(so);
+
+	if (sbspace(&so->so_rcv) < m_len) {
+		SOCK_RECVBUF_UNLOCK(so);
+		goto out;
+	}
+
+	sbappendstream_locked(&so->so_rcv, m, 0);
+	sorwakeup_locked(so);
+
+out:
+	VSOCK_UNLOCK(pcb);
+}
+
+static void
+vtsock_input(struct mbuf *m)
+{
+	struct vsock_addr remote, local;
+	struct virtio_vtsock_hdr *hdr;
+	struct epoch_tracker et;
+
+	hdr = mtod(m, struct virtio_vtsock_hdr *);
+	vtsock_populate_addr(hdr, &remote, &local);
+
+	SDT_PROBE1(vtsock, , , receive, hdr);
+
+	NET_EPOCH_ENTER(et);
+
 	switch (hdr->op) {
 	case VIRTIO_VTSOCK_OP_REQUEST:
-		if (!SOLISTENING(so)) {
-			vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
-			goto out;
-		}
-
-		CURVNET_SET(so->so_vnet);
-		newso = sonewconn(so, 0);
-		CURVNET_RESTORE();
-
-		if (newso == NULL) {
-			vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
-			goto out;
-		}
-
-		newpcb = newso->so_pcb;
-		newpcb->local.port = pcb->local.port;
-		newpcb->local.cid = vtsock_get_local_cid();
-		newpcb->remote.port = remote.port;
-		newpcb->remote.cid = remote.cid;
-		newpcb->ops = pcb->ops;
-
-		newprivate = newpcb->transport;
-		newprivate->peer_buf_alloc = private->peer_buf_alloc;
-		newprivate->peer_fwd_cnt = private->peer_fwd_cnt;
-		newprivate->fwd_cnt = 0;
-
-		soisconnected(newso);
-		vsock_pcb_insert_connected(newpcb);
-
-		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RESPONSE, newprivate);
-
+		vtsock_input_request(m);
 		break;
 	case VIRTIO_VTSOCK_OP_RESPONSE:
-		if (so->so_state & SS_ISCONNECTING) {
-			vsock_pcb_remove_bound(pcb);
-			vsock_pcb_insert_connected(pcb);
-			soisconnected(so);
-		} else {
-			vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
-		}
+		vtsock_input_response(m);
 		break;
 	case VIRTIO_VTSOCK_OP_RST:
-		if (so->so_state & SS_ISDISCONNECTING) {
-			soisdisconnected(so);
-		} else if (so->so_state & SS_ISCONNECTING) {
-			so->so_error = ECONNREFUSED;
-			soisdisconnected(so);
-		}
+		vtsock_input_reset(m);
 		break;
 	case VIRTIO_VTSOCK_OP_SHUTDOWN:
-		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, private);
-		vsock_pcb_remove_connected(pcb);
-		soisdisconnected(so);
-		sowwakeup(so);
+		vtsock_input_shutdown(m);
 		break;
 	case VIRTIO_VTSOCK_OP_CREDIT_UPDATE:
-		// Don't wake the sender thread up if the credit is still zero
-		if (vtsock_get_peer_credit(private) > 0) {
-			sowwakeup(private->so);
-		}
+		vtsock_input_credit_update(m);
 		break;
 	case VIRTIO_VTSOCK_OP_CREDIT_REQUEST:
-		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_CREDIT_UPDATE, private);
+		vtsock_input_credit_request(m);
 		break;
 	case VIRTIO_VTSOCK_OP_RW:
-		m_len = m_length(m, NULL) - sizeof(*hdr);
-
-		if (hdr->len == 0) {
-			goto out;
-		}
-
-		if (m_len != hdr->len) {
-			goto out;
-		}
-
-		if ((so->so_state & SS_ISCONNECTED) == 0) {
-			vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
-			goto out;
-		}
-
-		m_adj(m, sizeof(struct virtio_vtsock_hdr));
-		SOCK_RECVBUF_LOCK(so);
-
-		if (sbspace(&so->so_rcv) < m_len) {
-			SOCK_RECVBUF_UNLOCK(so);
-			goto out;
-		}
-
-		sbappendstream_locked(&so->so_rcv, m, 0);
-		sorwakeup_locked(so);
+		vtsock_input_data(m);
 		m = NULL;
 		break;
 	default:
 		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
 	}
 
-out:
-	VSOCK_UNLOCK(pcb);
 	NET_EPOCH_EXIT(et);
-out_error:
+
 	if (m) {
 		m_freem(m);
 	}
