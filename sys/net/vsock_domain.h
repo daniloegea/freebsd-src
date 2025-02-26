@@ -49,7 +49,7 @@ struct vsock_pcb {
 	struct vsock_addr		local;
 	struct vsock_addr		remote;
 	struct vsock_transport_ops 	*ops;
-	struct sx			sx;
+	struct mtx			mtx;
 	struct epoch_context		epoch_ctx;
 
 	/* Transport private data */
