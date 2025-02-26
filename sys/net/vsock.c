@@ -646,8 +646,6 @@ vsock_close(struct socket *so)
 {
 	struct vsock_pcb *pcb;
 
-	vsock_transport_lock();
-
 	pcb = so2vsockpcb(so);
 
 	KASSERT(pcb != NULL, ("vsock_close: pcb == NULL"));
@@ -655,15 +653,12 @@ vsock_close(struct socket *so)
 	if (SOLISTENING(so)) {
 		vsock_pcb_remove_bound(pcb);
 	}
-	vsock_transport_unlock();
 }
 
 static void
 vsock_abort(struct socket *so)
 {
 	struct vsock_pcb *pcb;
-
-	vsock_transport_lock();
 
 	pcb = so2vsockpcb(so);
 
@@ -676,8 +671,6 @@ vsock_abort(struct socket *so)
 	if (so->so_state & SS_ISCONNECTED) {
 		sodisconnect(so);
 	}
-
-	vsock_transport_unlock();
 }
 
 static int
@@ -762,7 +755,7 @@ vsock_pcballoc(void)
 		return (NULL);
 	}
 
-	sx_init(&pcb->sx, "vsock PCB shared/exclusive lock");
+	mtx_init(&pcb->mtx, "vsock PCB lock", NULL, MTX_DEF);
 
 	return (pcb);
 }
@@ -770,7 +763,7 @@ vsock_pcballoc(void)
 static void
 vsock_pcbfree(struct vsock_pcb *pcb)
 {
-	sx_destroy(&pcb->sx);
+	mtx_destroy(&pcb->mtx);
 	free(pcb, M_VSOCK);
 }
 
