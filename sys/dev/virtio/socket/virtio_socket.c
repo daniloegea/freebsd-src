@@ -1004,6 +1004,15 @@ vtsock_input_reset(struct mbuf *m)
 	pcb = vsock_pcb_lookup_connected(&local, &remote);
 
 	if (pcb == NULL) {
+		pcb = vsock_pcb_lookup_bound(&local);
+		if (pcb == NULL) {
+			return;
+		}
+
+		VSOCK_LOCK(pcb);
+		pcb->so->so_error = ECONNRESET;
+		soisdisconnected(pcb->so);
+		VSOCK_UNLOCK(pcb);
 		return;
 	}
 
