@@ -479,10 +479,12 @@ vsock_disconnect(struct socket *so)
 
 		if (error) {
 			error = pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, VSOCK_RESET, NULL);
+			vsock_pcb_remove_connected(pcb);
+			SOCK_UNLOCK(so);
+			soisdisconnected(so);
+			return (error);
 		}
 	}
-
-	vsock_pcb_remove_connected(pcb);
 
 out:
 	SOCK_UNLOCK(so);
@@ -516,6 +518,12 @@ vsock_sosend(struct socket *so, struct sockaddr *addr, struct uio *uio,
 
 	do {
 		SOCK_SENDBUF_LOCK(so);
+
+		if (pcb->peer_shutdown & SHUT_WR) {
+			SOCK_SENDBUF_UNLOCK(so);
+			error = EPIPE;
+			goto out;
+		}
 
 		if (so->so_snd.sb_state & SBS_CANTSENDMORE) {
 			SOCK_SENDBUF_UNLOCK(so);
@@ -598,6 +606,9 @@ vsock_receive(struct socket *so, struct sockaddr **psa, struct uio *uio,
 	struct vsock_pcb *pcb = so->so_pcb;
 
 	KASSERT(pcb != NULL, ("vsock_receive: pcb == NULL"));
+
+	if (resid_orig == 0 && pcb->peer_shutdown == SHUT_RDWR)
+		return (EPIPE);
 
 	error = soreceive_stream(so, psa, uio, mp, controlp, flagsp);
 
