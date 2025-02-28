@@ -439,7 +439,8 @@ vsock_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
 
 	VSOCK_LOCK(pcb);
 
-	pcb->local.cid = pcb->ops->get_local_cid();
+	if (pcb->local.cid == VMADDR_CID_ANY)
+		pcb->local.cid = pcb->ops->get_local_cid();
 	if (pcb->local.port == VMADDR_PORT_ANY)
 		pcb->local.port = vsock_last_source_port++;
 	pcb->remote.cid = vsock->svm_cid;
@@ -448,7 +449,8 @@ vsock_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
 	VSOCK_UNLOCK(pcb);
 
 	soisconnecting(so);
-	vsock_pcb_insert_bound(pcb);
+	if (vsock_pcb_lookup_bound(&pcb->local) == NULL)
+		vsock_pcb_insert_bound(pcb);
 
 	error = pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, VSOCK_REQUEST, NULL);
 
