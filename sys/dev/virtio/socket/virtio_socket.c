@@ -948,6 +948,7 @@ vtsock_input_response(struct mbuf *m)
 	struct vsock_addr remote, local;
 	struct virtio_vtsock_hdr *hdr;
 	struct vsock_pcb *pcb;
+	struct virtio_socket_data *private;
 	struct socket *so;
 
 	NET_EPOCH_ASSERT();
@@ -970,6 +971,9 @@ vtsock_input_response(struct mbuf *m)
 	}
 
 	so = pcb->so;
+	private = pcb->transport;
+	private->peer_fwd_cnt = hdr->fwd_cnt;
+	private->peer_buf_alloc = hdr->buf_alloc;
 
 	if (so->so_state & SS_ISCONNECTING) {
 		vsock_pcb_remove_bound(pcb);
@@ -989,6 +993,7 @@ vtsock_input_reset(struct mbuf *m)
 	struct vsock_addr remote, local;
 	struct virtio_vtsock_hdr *hdr;
 	struct vsock_pcb *pcb;
+	struct virtio_socket_data *private;
 	struct socket *so;
 
 	NET_EPOCH_ASSERT();
@@ -999,7 +1004,6 @@ vtsock_input_reset(struct mbuf *m)
 	pcb = vsock_pcb_lookup_connected(&local, &remote);
 
 	if (pcb == NULL) {
-		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
 		return;
 	}
 
@@ -1011,8 +1015,12 @@ vtsock_input_reset(struct mbuf *m)
 	}
 
 	so = pcb->so;
+	private = pcb->transport;
+	private->peer_fwd_cnt = hdr->fwd_cnt;
+	private->peer_buf_alloc = hdr->buf_alloc;
 
 	if (so->so_state & SS_ISDISCONNECTING) {
+		vsock_pcb_remove_connected(pcb);
 		soisdisconnected(so);
 	} else if (so->so_state & SS_ISCONNECTING) {
 		so->so_error = ECONNREFUSED;
@@ -1057,10 +1065,26 @@ vtsock_input_shutdown(struct mbuf *m)
 	private->peer_fwd_cnt = hdr->fwd_cnt;
 	private->peer_buf_alloc = hdr->buf_alloc;
 
-	vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, private);
-	vsock_pcb_remove_connected(pcb);
-	soisdisconnected(so);
-	sowwakeup(so);
+	if (hdr->flags & VIRTIO_VTSOCK_SHUTDOWN_F_RECEIVE) {
+		pcb->peer_shutdown |= SHUT_WR;
+	}
+
+	if (hdr->flags & VIRTIO_VTSOCK_SHUTDOWN_F_SEND) {
+		pcb->peer_shutdown |= SHUT_RD;
+	}
+
+	/* Both flags set means the peer initiated a disconnection */
+	if (pcb->peer_shutdown == (VIRTIO_VTSOCK_SHUTDOWN_F_RECEIVE | VIRTIO_VTSOCK_SHUTDOWN_F_SEND)) {
+		soisdisconnecting(so);
+
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, private);
+
+		vsock_pcb_remove_connected(pcb);
+
+		soisdisconnected(so);
+		sowwakeup(so);
+		sorwakeup(so);
+	}
 
 out:
 	VSOCK_UNLOCK(pcb);
@@ -1174,6 +1198,10 @@ vtsock_input_data(struct mbuf *m)
 	}
 
 	so = pcb->so;
+	if ((so->so_state & SS_ISCONNECTED) == 0) {
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
+		goto out;
+	}
 	private = pcb->transport;
 	private->peer_fwd_cnt = hdr->fwd_cnt;
 	private->peer_buf_alloc = hdr->buf_alloc;
@@ -1185,11 +1213,6 @@ vtsock_input_data(struct mbuf *m)
 	}
 
 	if (m_len != hdr->len) {
-		goto out;
-	}
-
-	if ((so->so_state & SS_ISCONNECTED) == 0) {
-		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
 		goto out;
 	}
 
