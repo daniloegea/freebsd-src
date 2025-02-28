@@ -519,7 +519,7 @@ vsock_sosend(struct socket *so, struct sockaddr *addr, struct uio *uio,
 	do {
 		SOCK_SENDBUF_LOCK(so);
 
-		if (pcb->peer_shutdown & SHUT_WR) {
+		if (pcb->peer_shutdown & VSOCK_SHUT_SND) {
 			SOCK_SENDBUF_UNLOCK(so);
 			error = EPIPE;
 			goto out;
@@ -607,7 +607,7 @@ vsock_receive(struct socket *so, struct sockaddr **psa, struct uio *uio,
 
 	KASSERT(pcb != NULL, ("vsock_receive: pcb == NULL"));
 
-	if (resid_orig == 0 && pcb->peer_shutdown == SHUT_RDWR)
+	if (resid_orig == 0 && pcb->peer_shutdown == VSOCK_SHUT_ALL)
 		return (EPIPE);
 
 	error = soreceive_stream(so, psa, uio, mp, controlp, flagsp);

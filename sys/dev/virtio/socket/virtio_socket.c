@@ -1075,15 +1075,15 @@ vtsock_input_shutdown(struct mbuf *m)
 	private->peer_buf_alloc = hdr->buf_alloc;
 
 	if (hdr->flags & VIRTIO_VTSOCK_SHUTDOWN_F_RECEIVE) {
-		pcb->peer_shutdown |= SHUT_WR;
+		pcb->peer_shutdown |= VSOCK_SHUT_RCV;
 	}
 
 	if (hdr->flags & VIRTIO_VTSOCK_SHUTDOWN_F_SEND) {
-		pcb->peer_shutdown |= SHUT_RD;
+		pcb->peer_shutdown |= VSOCK_SHUT_SND;
 	}
 
 	/* Both flags set means the peer initiated a disconnection */
-	if (pcb->peer_shutdown == (VIRTIO_VTSOCK_SHUTDOWN_F_RECEIVE | VIRTIO_VTSOCK_SHUTDOWN_F_SEND)) {
+	if (pcb->peer_shutdown == VSOCK_SHUT_ALL) {
 		soisdisconnecting(so);
 
 		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, private);
