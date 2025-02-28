@@ -38,6 +38,10 @@
 #define	VSOCK_RCV_BUFFER_SIZE	(256 * 1024)
 #define	VSOCK_MAX_MSG_SIZE	(64 * 1024)
 
+#define	VSOCK_SHUT_RCV		0x01
+#define	VSOCK_SHUT_SND		0x02
+#define	VSOCK_SHUT_ALL		0x03
+
 struct vsock_addr {
 	uint32_t port;
 	uint32_t cid;
