@@ -48,6 +48,7 @@ struct vsock_pcb {
 	struct socket			*so;
 	struct vsock_addr		local;
 	struct vsock_addr		remote;
+	uint32_t			peer_shutdown;
 	struct vsock_transport_ops 	*ops;
 	struct mtx			mtx;
 	struct epoch_context		epoch_ctx;
