@@ -519,7 +519,7 @@ vsock_sosend(struct socket *so, struct sockaddr *addr, struct uio *uio,
 	do {
 		SOCK_SENDBUF_LOCK(so);
 
-		if (pcb->peer_shutdown & VSOCK_SHUT_SND) {
+		if (pcb->peer_shutdown & VSOCK_SHUT_RCV) {
 			SOCK_SENDBUF_UNLOCK(so);
 			error = EPIPE;
 			goto out;
