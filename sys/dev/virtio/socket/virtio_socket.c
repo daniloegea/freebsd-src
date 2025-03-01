@@ -615,9 +615,7 @@ vtsock_send(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enu
 	}
 
 	fwd_cnt = private->fwd_cnt;
-	SOCK_RECVBUF_LOCK(private->so);
-	buf_alloc = private->so->so_rcv.sb_hiwat;
-	SOCK_RECVBUF_UNLOCK(private->so);
+	buf_alloc = private->buf_alloc;
 	private->last_fwd_cnt = fwd_cnt;
 	private->last_buf_alloc = buf_alloc;
 
@@ -708,9 +706,7 @@ vtsock_send_control(struct vsock_addr *src, struct vsock_addr *dst, int op, stru
 
 	if (private != NULL) {
 		fwd_cnt = private->fwd_cnt;
-		SOCK_RECVBUF_LOCK(private->so);
-		buf_alloc = private->so->so_rcv.sb_hiwat;
-		SOCK_RECVBUF_UNLOCK(private->so);
+		buf_alloc = private->buf_alloc;
 	}
 
 	m = m_get2(sizeof(struct virtio_vtsock_hdr), M_NOWAIT, MT_DATA, 0);
@@ -1132,7 +1128,7 @@ vtsock_input_credit_update(struct mbuf *m)
 
 	// Don't wake the sender thread up if the credit is still zero
 	if (vtsock_get_peer_credit(private) > 0) {
-		sowwakeup(private->so);
+		sowwakeup(pcb->so);
 	}
 
 out:
@@ -1360,7 +1356,10 @@ vtsock_attach_socket(struct vsock_pcb *pcb)
 	if (private == NULL) {
 		return (ENOMEM);
 	}
-	private->so = pcb->so;
+
+	SOCK_RECVBUF_LOCK(pcb->so);
+	private->buf_alloc = pcb->so->so_rcv.sb_hiwat;
+	SOCK_RECVBUF_UNLOCK(pcb->so);
 	private->last_buf_alloc = VSOCK_RCV_BUFFER_SIZE;
 
 	pcb->transport = private;
