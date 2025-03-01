@@ -52,9 +52,9 @@ struct virtio_vtsock_hdr {
 } __packed;
 
 struct virtio_socket_data {
-	struct socket	*so;
 	struct mtx	mtx;
 	uint32_t	fwd_cnt;
+	uint32_t	buf_alloc;
 	uint32_t	tx_cnt;
 	uint32_t	peer_buf_alloc;
 	uint32_t	peer_fwd_cnt;
