@@ -1006,8 +1006,10 @@ vtsock_input_reset(struct mbuf *m)
 		}
 
 		VSOCK_LOCK(pcb);
-		pcb->so->so_error = ECONNRESET;
-		soisdisconnected(pcb->so);
+		if (!SOLISTENING(pcb->so)) {
+			pcb->so->so_error = ECONNRESET;
+			soisdisconnected(pcb->so);
+		}
 		VSOCK_UNLOCK(pcb);
 		return;
 	}
