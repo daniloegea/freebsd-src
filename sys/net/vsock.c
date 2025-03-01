@@ -314,6 +314,8 @@ vsock_pcb_destroy_cb(struct epoch_context *ctx)
 
 	pcb = __containerof(ctx, struct vsock_pcb, epoch_ctx);
 
+	pcb->ops->detach_socket(pcb);
+
 	vsock_pcbfree(pcb);
 }
 
@@ -330,8 +332,6 @@ vsock_detach(struct socket *so)
 
 	vsock_pcb_remove_bound(pcb);
 	vsock_pcb_remove_connected(pcb);
-
-	pcb->ops->detach_socket(pcb);
 
 	VSOCK_LOCK(pcb);
 	pcb->so = NULL;
