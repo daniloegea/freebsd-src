@@ -687,6 +687,7 @@ vtsock_output(struct mbuf *m)
 
 	SDT_PROBE1(vtsock, , , send, mtod(m, struct virtio_vtsock_hdr *));
 
+	// XXX: Need to find a way to make the thread wait when the ring buffer is out of space.
 	error = buf_ring_enqueue(txq->vtstx_br, m);
 
 	if (error) {
@@ -875,17 +876,15 @@ vtsock_populate_addr(struct virtio_vtsock_hdr *hdr, struct vsock_addr *remote, s
 }
 
 static void
-vtsock_input_request(struct mbuf *m)
+vtsock_input_request(struct virtio_vtsock_hdr *hdr)
 {
 	struct vsock_addr remote, local;
-	struct virtio_vtsock_hdr *hdr;
 	struct vsock_pcb *pcb, *newpcb;
 	struct virtio_socket_data *private;
 	struct socket *so, *newso;
 
 	NET_EPOCH_ASSERT();
 
-	hdr = mtod(m, struct virtio_vtsock_hdr *);
 	vtsock_populate_addr(hdr, &remote, &local);
 
 	pcb = vsock_pcb_lookup_bound(&local);
@@ -939,17 +938,15 @@ out:
 }
 
 static void
-vtsock_input_response(struct mbuf *m)
+vtsock_input_response(struct virtio_vtsock_hdr *hdr)
 {
 	struct vsock_addr remote, local;
-	struct virtio_vtsock_hdr *hdr;
 	struct vsock_pcb *pcb;
 	struct virtio_socket_data *private;
 	struct socket *so;
 
 	NET_EPOCH_ASSERT();
 
-	hdr = mtod(m, struct virtio_vtsock_hdr *);
 	vtsock_populate_addr(hdr, &remote, &local);
 
 	pcb = vsock_pcb_lookup_bound(&local);
@@ -984,17 +981,15 @@ out:
 }
 
 static void
-vtsock_input_reset(struct mbuf *m)
+vtsock_input_reset(struct virtio_vtsock_hdr *hdr)
 {
 	struct vsock_addr remote, local;
-	struct virtio_vtsock_hdr *hdr;
 	struct vsock_pcb *pcb;
 	struct virtio_socket_data *private;
 	struct socket *so;
 
 	NET_EPOCH_ASSERT();
 
-	hdr = mtod(m, struct virtio_vtsock_hdr *);
 	vtsock_populate_addr(hdr, &remote, &local);
 
 	pcb = vsock_pcb_lookup_connected(&local, &remote);
@@ -1039,17 +1034,15 @@ out:
 }
 
 static void
-vtsock_input_shutdown(struct mbuf *m)
+vtsock_input_shutdown(struct virtio_vtsock_hdr *hdr)
 {
 	struct vsock_addr remote, local;
-	struct virtio_vtsock_hdr *hdr;
 	struct virtio_socket_data *private;
 	struct vsock_pcb *pcb;
 	struct socket *so;
 
 	NET_EPOCH_ASSERT();
 
-	hdr = mtod(m, struct virtio_vtsock_hdr *);
 	vtsock_populate_addr(hdr, &remote, &local);
 
 
@@ -1098,16 +1091,14 @@ out:
 }
 
 static void
-vtsock_input_credit_update(struct mbuf *m)
+vtsock_input_credit_update(struct virtio_vtsock_hdr *hdr)
 {
 	struct vsock_addr remote, local;
-	struct virtio_vtsock_hdr *hdr;
 	struct virtio_socket_data *private;
 	struct vsock_pcb *pcb;
 
 	NET_EPOCH_ASSERT();
 
-	hdr = mtod(m, struct virtio_vtsock_hdr *);
 	vtsock_populate_addr(hdr, &remote, &local);
 
 	pcb = vsock_pcb_lookup_connected(&local, &remote);
@@ -1138,16 +1129,14 @@ out:
 }
 
 static void
-vtsock_input_credit_request(struct mbuf *m)
+vtsock_input_credit_request(struct virtio_vtsock_hdr *hdr)
 {
 	struct vsock_addr remote, local;
-	struct virtio_vtsock_hdr *hdr;
 	struct virtio_socket_data *private;
 	struct vsock_pcb *pcb;
 
 	NET_EPOCH_ASSERT();
 
-	hdr = mtod(m, struct virtio_vtsock_hdr *);
 	vtsock_populate_addr(hdr, &remote, &local);
 
 	pcb = vsock_pcb_lookup_connected(&local, &remote);
@@ -1175,10 +1164,9 @@ out:
 }
 
 static void
-vtsock_input_data(struct mbuf *m)
+vtsock_input_data(struct mbuf *m, struct virtio_vtsock_hdr *hdr)
 {
 	struct vsock_addr remote, local;
-	struct virtio_vtsock_hdr *hdr;
 	struct virtio_socket_data *private;
 	struct vsock_pcb *pcb;
 	struct socket *so;
@@ -1186,9 +1174,7 @@ vtsock_input_data(struct mbuf *m)
 
 	NET_EPOCH_ASSERT();
 
-	hdr = mtod(m, struct virtio_vtsock_hdr *);
 	vtsock_populate_addr(hdr, &remote, &local);
-
 
 	pcb = vsock_pcb_lookup_connected(&local, &remote);
 
@@ -1213,17 +1199,16 @@ vtsock_input_data(struct mbuf *m)
 	private->peer_fwd_cnt = hdr->fwd_cnt;
 	private->peer_buf_alloc = hdr->buf_alloc;
 
-	m_len = m_length(m, NULL) - sizeof(*hdr);
-
 	if (hdr->len == 0) {
 		goto out;
 	}
+
+	m_len = m_length(m, NULL);
 
 	if (m_len != hdr->len) {
 		goto out;
 	}
 
-	m_adj(m, sizeof(struct virtio_vtsock_hdr));
 	SOCK_RECVBUF_LOCK(so);
 
 	if (sbspace(&so->so_rcv) < m_len) {
@@ -1246,7 +1231,6 @@ vtsock_input(struct mbuf *m)
 	struct epoch_tracker et;
 
 	hdr = mtod(m, struct virtio_vtsock_hdr *);
-	vtsock_populate_addr(hdr, &remote, &local);
 
 	SDT_PROBE1(vtsock, , , receive, hdr);
 
@@ -1254,28 +1238,30 @@ vtsock_input(struct mbuf *m)
 
 	switch (hdr->op) {
 	case VIRTIO_VTSOCK_OP_REQUEST:
-		vtsock_input_request(m);
+		vtsock_input_request(hdr);
 		break;
 	case VIRTIO_VTSOCK_OP_RESPONSE:
-		vtsock_input_response(m);
+		vtsock_input_response(hdr);
 		break;
 	case VIRTIO_VTSOCK_OP_RST:
-		vtsock_input_reset(m);
+		vtsock_input_reset(hdr);
 		break;
 	case VIRTIO_VTSOCK_OP_SHUTDOWN:
-		vtsock_input_shutdown(m);
+		vtsock_input_shutdown(hdr);
 		break;
 	case VIRTIO_VTSOCK_OP_CREDIT_UPDATE:
-		vtsock_input_credit_update(m);
+		vtsock_input_credit_update(hdr);
 		break;
 	case VIRTIO_VTSOCK_OP_CREDIT_REQUEST:
-		vtsock_input_credit_request(m);
+		vtsock_input_credit_request(hdr);
 		break;
 	case VIRTIO_VTSOCK_OP_RW:
-		vtsock_input_data(m);
+		m_adj(m, sizeof(struct virtio_vtsock_hdr));
+		vtsock_input_data(m, hdr);
 		m = NULL;
 		break;
 	default:
+		vtsock_populate_addr(hdr, &remote, &local);
 		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, NULL);
 	}
 
