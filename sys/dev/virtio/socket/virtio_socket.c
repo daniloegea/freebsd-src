@@ -69,6 +69,8 @@ struct vtsock_txq {
 	struct cv		vtstx_cv;
 	struct vtsock_softc	*vtstx_sc;
 	struct buf_ring		*vtstx_br;
+	struct mtx		vtstx_br_mtx;
+	struct cv		vtstx_br_cv;
 	struct virtqueue	*vtstx_vq;
 	struct sglist		*vtstx_sg;
 	struct taskqueue	*vtsock_txq;
@@ -240,6 +242,8 @@ vtsock_attach(device_t dev)
 	mtx_init(&sc->vtsock_mtx, "vtsockmtx", NULL, MTX_DEF);
 	mtx_init(&sc->vtsock_txq.vtstx_mtx, "vtsocktxvqmtx", NULL, MTX_DEF);
 	cv_init(&sc->vtsock_txq.vtstx_cv, "Conditional variable for TX queue");
+	mtx_init(&sc->vtsock_txq.vtstx_br_mtx, "vtsocktxvqbrmtx", NULL, MTX_DEF);
+	cv_init(&sc->vtsock_txq.vtstx_br_cv, "Conditional variable for TX buf ring");
 
 	vtsock_read_config(sc, &sc->vtsock_config);
 
@@ -411,6 +415,8 @@ vtsock_detach(device_t dev)
 	mtx_destroy(&sc->vtsock_mtx);
 	mtx_destroy(&txq->vtstx_mtx);
 	cv_destroy(&txq->vtstx_cv);
+	mtx_destroy(&txq->vtstx_br_mtx);
+	cv_destroy(&txq->vtstx_br_cv);
 
 	return (0);
 }
@@ -684,16 +690,27 @@ vtsock_output(struct mbuf *m)
 {
 	struct vtsock_txq *txq = &vtsock_softc->vtsock_txq;
 	int error;
+	int tries = 5;
 
 	SDT_PROBE1(vtsock, , , send, mtod(m, struct virtio_vtsock_hdr *));
 
-	// XXX: Need to find a way to make the thread wait when the ring buffer is out of space.
+	mtx_lock(&txq->vtstx_br_mtx);
+again:
 	error = buf_ring_enqueue(txq->vtstx_br, m);
 
 	if (error) {
+		if (error == ENOBUFS && tries > 0) {
+			taskqueue_enqueue(txq->vtsock_txq, &txq->vtsock_intrtask);
+			cv_wait(&txq->vtstx_br_cv, &txq->vtstx_br_mtx);
+			tries--;
+			goto again;
+		}
 		printf("buf_ring_enqueue failed (current lenght: %d): %d\n", buf_ring_count(txq->vtstx_br), error);
+		mtx_unlock(&txq->vtstx_br_mtx);
+		return (error);
 	}
 
+	mtx_unlock(&txq->vtstx_br_mtx);
 	return (taskqueue_enqueue(txq->vtsock_txq, &txq->vtsock_intrtask));
 }
 
@@ -861,7 +878,7 @@ vtsock_tx_task(void *ctx, int pending __unused)
 		} else {
 			printf("virtqueue_enqueue error: %d, mbuf->m_len: %d\n", error, m->m_len);
 		}
-
+		cv_signal(&txq->vtstx_br_cv);
 	}
 	mtx_unlock(&txq->vtstx_mtx);
 }
