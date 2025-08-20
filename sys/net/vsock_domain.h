@@ -36,6 +36,7 @@
 #include <sys/epoch.h>
 
 #define	VSOCK_RCV_BUFFER_SIZE	(256 * 1024)
+#define	VSOCK_SND_BUFFER_SIZE	(256 * 1024)
 #define	VSOCK_MAX_MSG_SIZE	(64 * 1024)
 
 #define	VSOCK_SHUT_RCV		0x01
