@@ -136,7 +136,8 @@ static void	vtsock_rx_task(void *xtxq, int pending __unused);
 static void	vtsock_tx_task(void *xtxq, int pending __unused);
 
 static void	vtsock_input(struct mbuf *m);
-static int	vtsock_send(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enum vsock_ops op, struct mbuf *m);
+static int	vtsock_send_internal(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enum vsock_ops op, struct mbuf *m);
+static int	vtsock_send(struct vsock_pcb *pcb, enum vsock_ops op);
 static int	vtsock_send_control(struct vsock_addr *src, struct vsock_addr *dst, int op, struct virtio_socket_data *private);
 static int	vtsock_output(struct mbuf *m);
 static void	vtsock_post_receive(struct vsock_pcb *pcb, uint32_t received);
@@ -596,7 +597,7 @@ vtsock_setup_features(struct vtsock_softc *sc)
 }
 
 static int
-vtsock_send(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enum vsock_ops op, struct mbuf *m)
+vtsock_send_internal(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enum vsock_ops op, struct mbuf *m)
 {
 	struct virtio_vtsock_hdr *hdr;
 	struct virtio_socket_data *private = transport;
@@ -620,10 +621,12 @@ vtsock_send(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enu
 		len = 0;
 	}
 
+	PRIVATE_LOCK(private);
 	fwd_cnt = private->fwd_cnt;
 	buf_alloc = private->buf_alloc;
 	private->last_fwd_cnt = fwd_cnt;
 	private->last_buf_alloc = buf_alloc;
+	PRIVATE_UNLOCK(private);
 
 	switch (op) {
 	case VSOCK_DATA:
@@ -676,12 +679,71 @@ vtsock_send(void *transport, struct vsock_addr *src, struct vsock_addr *dst, enu
 
 	error = vtsock_output(m);
 
-	if (error) {
-		return (error);
+	if (!error && op == VSOCK_DATA) {
+		PRIVATE_LOCK(private);
+		private->tx_cnt += len;
+		PRIVATE_UNLOCK(private);
 	}
 
-	private->tx_cnt += len;
+	return (error);
+}
 
+static int
+vtsock_send(struct vsock_pcb *pcb, enum vsock_ops op)
+{
+	struct mbuf *m;
+	struct sockbuf *sb;
+	volatile uint32_t writable, towrite, sosnd_size;
+	int error = 0;
+
+	if (op != VSOCK_DATA)
+		return (vtsock_send_internal(pcb->transport, &pcb->local, &pcb->remote, op, NULL));
+
+	do {
+		writable = vtsock_check_writable(pcb, FALSE);
+
+		if (writable == 0) {
+			writable = vtsock_check_writable(pcb, TRUE);
+
+			SOCKBUF_LOCK(&pcb->so->so_snd);
+			sb = sobuf(pcb->so, SO_SND);
+			sb->sb_flags |= SB_WAIT;
+			/* Wait until we receive a credit update or check again in 100ms */
+			error = msleep_sbt(&sb->sb_acc, soeventmtx(pcb->so, SO_SND),
+				PSOCK | PCATCH, "sbwait", SBT_1MS * 100, 0, 0);
+			SOCKBUF_UNLOCK(&pcb->so->so_snd);
+
+			if (!(pcb->so->so_state & SS_ISCONNECTED))
+				goto out;
+
+			if (error == EWOULDBLOCK)
+				continue;
+
+			if (error)
+				goto out;
+
+			continue;
+		}
+
+		SOCKBUF_LOCK(&pcb->so->so_snd);
+		sosnd_size = sbavail(&pcb->so->so_snd);
+		SOCKBUF_UNLOCK(&pcb->so->so_snd);
+		towrite = MIN(writable, VTSOCK_MAX_MSG_SIZE);
+		towrite = MIN(towrite, sosnd_size);
+
+		if (towrite > 0) {
+			SOCKBUF_LOCK(&pcb->so->so_snd);
+			m = m_copym(pcb->so->so_snd.sb_mb, 0, towrite, M_NOWAIT);
+			sbdrop_locked(&pcb->so->so_snd, towrite);
+			SOCKBUF_UNLOCK(&pcb->so->so_snd);
+			error = vtsock_send_internal(pcb->transport, &pcb->local, &pcb->remote, VSOCK_DATA, m);
+			if (error)
+				return (error);
+		}
+
+	} while(towrite > 0);
+
+out:
 	return (error);
 }
 
@@ -1035,8 +1097,10 @@ vtsock_input_reset(struct virtio_vtsock_hdr *hdr)
 
 	so = pcb->so;
 	private = pcb->transport;
+	PRIVATE_LOCK(private);
 	private->peer_fwd_cnt = hdr->fwd_cnt;
 	private->peer_buf_alloc = hdr->buf_alloc;
+	PRIVATE_UNLOCK(private);
 
 	if (so->so_state & SS_ISDISCONNECTING) {
 		vsock_pcb_remove_connected(pcb);
@@ -1079,8 +1143,10 @@ vtsock_input_shutdown(struct virtio_vtsock_hdr *hdr)
 
 	so = pcb->so;
 	private = pcb->transport;
+	PRIVATE_LOCK(private);
 	private->peer_fwd_cnt = hdr->fwd_cnt;
 	private->peer_buf_alloc = hdr->buf_alloc;
+	PRIVATE_UNLOCK(private);
 
 	if (hdr->flags & VIRTIO_VTSOCK_SHUTDOWN_F_RECEIVE) {
 		pcb->peer_shutdown |= VSOCK_SHUT_RCV;
@@ -1133,8 +1199,10 @@ vtsock_input_credit_update(struct virtio_vtsock_hdr *hdr)
 	}
 
 	private = pcb->transport;
+	PRIVATE_LOCK(private);
 	private->peer_fwd_cnt = hdr->fwd_cnt;
 	private->peer_buf_alloc = hdr->buf_alloc;
+	PRIVATE_UNLOCK(private);
 
 	// Don't wake the sender thread up if the credit is still zero
 	if (vtsock_get_peer_credit(private) > 0) {
@@ -1171,8 +1239,10 @@ vtsock_input_credit_request(struct virtio_vtsock_hdr *hdr)
 	}
 
 	private = pcb->transport;
+	PRIVATE_LOCK(private);
 	private->peer_fwd_cnt = hdr->fwd_cnt;
 	private->peer_buf_alloc = hdr->buf_alloc;
+	PRIVATE_UNLOCK(private);
 
 	vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_CREDIT_UPDATE, private);
 
@@ -1213,8 +1283,10 @@ vtsock_input_data(struct mbuf *m, struct virtio_vtsock_hdr *hdr)
 		goto out;
 	}
 	private = pcb->transport;
+	PRIVATE_LOCK(private);
 	private->peer_fwd_cnt = hdr->fwd_cnt;
 	private->peer_buf_alloc = hdr->buf_alloc;
+	PRIVATE_UNLOCK(private);
 
 	if (hdr->len == 0) {
 		goto out;
@@ -1303,7 +1375,7 @@ vtsock_post_receive(struct vsock_pcb *pcb, uint32_t received)
 	* send a credit update proactively.
 	*/
 	if ((private->fwd_cnt - private->last_fwd_cnt + (VTSOCK_BUFSZ << 2) ) >= private->last_buf_alloc) {
-		vtsock_send(private, &pcb->local, &pcb->remote, VSOCK_CREDIT_UPDATE, NULL);
+		vtsock_send_internal(private, &pcb->local, &pcb->remote, VSOCK_CREDIT_UPDATE, NULL);
 	}
 }
 
