@@ -1,7 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Copyright (c) 2024, Danilo Egea Gondolfo <danilo@FreeBSD.org>
+ * Copyright (c) 2025, Danilo Egea Gondolfo <danilo@FreeBSD.org>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -763,6 +763,7 @@ again:
 	if (error) {
 		if (error == ENOBUFS && tries > 0) {
 			taskqueue_enqueue(txq->vtsock_txq, &txq->vtsock_intrtask);
+			// Wait for space in the ring buffer
 			cv_wait(&txq->vtstx_br_cv, &txq->vtstx_br_mtx);
 			tries--;
 			goto again;
@@ -814,6 +815,7 @@ vtsock_rx_intr(void *ctx) {
 	error = taskqueue_enqueue(rxq->vtsock_rxq, &rxq->vtsock_intrtask);
 	if (error) {
 		printf("taskqueue_enqueue failed %d\n", error);
+		// TODO: what do I do if it fails?
 	}
 }
 
@@ -928,6 +930,7 @@ vtsock_tx_task(void *ctx, int pending __unused)
 		error = sglist_append_mbuf(sg, m);
 		if (error) {
 			printf("sglist_append_mbuf failed: %d\n", error);
+			// TODO: What do we do if it fails?
 		}
 
 	again:
@@ -935,11 +938,14 @@ vtsock_tx_task(void *ctx, int pending __unused)
 		if (error == 0) {
 			virtqueue_notify(vq);
 		} else if (error == ENOSPC || error == EMSGSIZE) {
+			// Wait for space in the virtqueue
 			cv_wait(&txq->vtstx_cv, &txq->vtstx_mtx);
 			goto again;
 		} else {
 			printf("virtqueue_enqueue error: %d, mbuf->m_len: %d\n", error, m->m_len);
+			// TODO: what do we do if it fails?
 		}
+		// signals the sending thread that the is more space in the ring buffer
 		cv_signal(&txq->vtstx_br_cv);
 	}
 	mtx_unlock(&txq->vtstx_mtx);
@@ -1158,15 +1164,9 @@ vtsock_input_shutdown(struct virtio_vtsock_hdr *hdr)
 
 	/* Both flags set means the peer initiated a disconnection */
 	if (pcb->peer_shutdown == VSOCK_SHUT_ALL) {
-		soisdisconnecting(so);
-
-		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, private);
-
-		vsock_pcb_remove_connected(pcb);
-
 		soisdisconnected(so);
-		sowwakeup(so);
-		sorwakeup(so);
+		vsock_pcb_remove_connected(pcb);
+		vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RST, private);
 	}
 
 out:
