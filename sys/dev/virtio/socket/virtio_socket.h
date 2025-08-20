@@ -90,5 +90,6 @@ struct virtio_socket_data {
 
 #define VTSOCK_BUFSZ			(16 * 1024)
 #define VTSOCK_TX_RINGBUFFER_SIZE	1024
+#define	VTSOCK_MAX_MSG_SIZE		(64 * 1024)
 
 #endif /* _VIRTIO_SOCKET_H */
