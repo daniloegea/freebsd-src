@@ -1,7 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Copyright (c) 2024, Danilo Egea Gondolfo <danilo@FreeBSD.org>
+ * Copyright (c) 2025, Danilo Egea Gondolfo <danilo@FreeBSD.org>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -36,10 +36,11 @@
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/sx.h>
-#include <sys/sglist.h>
 #include <sys/sysctl.h>
-#include <sys/taskqueue.h>
 #include <sys/queue.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <sys/sdt.h>
 
 #include <sys/domain.h>
 #include <sys/protosw.h>
@@ -49,13 +50,7 @@
 #include <sys/sysproto.h>
 #include <sys/sockbuf.h>
 #include <sys/mbuf.h>
-
 #include <net/vnet.h>
-
-#include <sys/types.h>
-#include <sys/uio.h>
-
-#include <sys/sdt.h>
 
 #include <sys/vm_sockets.h>
 #include <net/vsock_transport.h>
@@ -291,7 +286,7 @@ vsock_attach(struct socket *so, int proto, struct thread *td)
 	so->so_pcb = pcb;
 	error = soreserve(so, VSOCK_SND_BUFFER_SIZE, VSOCK_RCV_BUFFER_SIZE);
 
-	if (error != 0) {
+	if (error) {
 		goto out;
 	}
 
@@ -402,6 +397,7 @@ vsock_accept(struct socket *so, struct sockaddr *sa)
 	struct vsock_pcb *pcb = so2vsockpcb(so);
 	struct sockaddr_vm sockaddr;
 
+	bzero(&sockaddr, sizeof(sockaddr));
 	sockaddr.svm_len = sizeof(struct sockaddr_vm);
 	sockaddr.svm_family = AF_VSOCK;
 	sockaddr.svm_port = pcb->remote.port;
@@ -522,9 +518,6 @@ vsock_receive(struct socket *so, struct sockaddr **psa, struct uio *uio,
 	struct vsock_pcb *pcb = so->so_pcb;
 
 	KASSERT(pcb != NULL, ("vsock_receive: pcb == NULL"));
-
-	if (resid_orig == 0 && pcb->peer_shutdown == VSOCK_SHUT_ALL)
-		return (EPIPE);
 
 	error = soreceive_stream(so, psa, uio, mp, controlp, flagsp);
 

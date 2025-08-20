@@ -28,8 +28,6 @@
 #ifndef _VIRTIO_SOCKET_H
 #define _VIRTIO_SOCKET_H
 
-#include <sys/types.h>
-
 struct virtio_vtsock_config {
 	uint64_t guest_cid;
 };
