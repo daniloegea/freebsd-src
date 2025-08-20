@@ -97,8 +97,8 @@ static int	vsock_accept(struct socket *so, struct sockaddr *td);
 static int	vsock_connect(struct socket *so, struct sockaddr *sa, struct thread *td);
 static int	vsock_peeraddr(struct socket *so, struct sockaddr *sa);
 static int	vsock_sockaddr(struct socket *so, struct sockaddr *sa);
-static int	vsock_sosend(struct socket *so, struct sockaddr *addr, struct uio *uio,
-			struct mbuf *top, struct mbuf *control, int flags, struct thread *td);
+static int	vsock_send(struct socket *so, int flags, struct mbuf *m,
+			struct sockaddr *nam, struct mbuf *control, struct thread *td);
 int		vsock_receive(struct socket *so, struct sockaddr **psa, struct uio *uio,
 			struct mbuf **mp, struct mbuf **controlp, int *flagsp);
 static int	vsock_disconnect(struct socket *so);
@@ -120,7 +120,7 @@ static struct protosw vsock_protosw = {
 	.pr_peeraddr =		vsock_peeraddr,
 	.pr_sockaddr =		vsock_sockaddr,
 	.pr_soreceive =		vsock_receive,
-	.pr_sosend =		vsock_sosend,
+	.pr_send =		vsock_send,
 	.pr_disconnect =	vsock_disconnect,
 	.pr_close =		vsock_close,
 	.pr_detach =		vsock_detach,
@@ -289,7 +289,7 @@ vsock_attach(struct socket *so, int proto, struct thread *td)
 
 	pcb->so = so;
 	so->so_pcb = pcb;
-	error = soreserve(so, 0, VSOCK_RCV_BUFFER_SIZE);
+	error = soreserve(so, VSOCK_SND_BUFFER_SIZE, VSOCK_RCV_BUFFER_SIZE);
 
 	if (error != 0) {
 		goto out;
@@ -452,7 +452,7 @@ vsock_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
 	if (vsock_pcb_lookup_bound(&pcb->local) == NULL)
 		vsock_pcb_insert_bound(pcb);
 
-	error = pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, VSOCK_REQUEST, NULL);
+	error = pcb->ops->send_message(pcb, VSOCK_REQUEST);
 
 	if (so->so_state & SS_NBIO) {
 		error = EINPROGRESS;
@@ -473,14 +473,14 @@ vsock_disconnect(struct socket *so)
 
 	SOCK_LOCK(so);
 	if ((so->so_state & SS_ISDISCONNECTED) == 0) {
-		error = pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, VSOCK_DISCONNECT, NULL);
+		error = pcb->ops->send_message(pcb, VSOCK_DISCONNECT);
 		if (error)
 			goto out;
 
 		error = msleep(&so->so_timeo, &so->so_lock, PSOCK | PCATCH, "disconnect", hz);
 
 		if (error) {
-			error = pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, VSOCK_RESET, NULL);
+			error = pcb->ops->send_message(pcb, VSOCK_RESET);
 			vsock_pcb_remove_connected(pcb);
 			SOCK_UNLOCK(so);
 			soisdisconnected(so);
@@ -493,108 +493,22 @@ out:
 	return (error);
 }
 
-int
-vsock_sosend(struct socket *so, struct sockaddr *addr, struct uio *uio,
-    struct mbuf *top, struct mbuf *control, int flags, struct thread *td)
+static int
+vsock_send(struct socket *so, int flags, struct mbuf *m,
+    struct sockaddr *nam, struct mbuf *control, struct thread *td)
 {
-	int error;
-	ssize_t resid;
-	uint32_t writable, towrite;
-	struct vsock_pcb *pcb = so2vsockpcb(so);
+	struct vsock_pcb *pcb;
+	int error = 0;
 
-	error = SOCK_IO_SEND_LOCK(so, SBLOCKWAIT(flags));
-	if (error)
-		return (error);
+	if (m == NULL)
+		return (0);
 
-	resid = uio->uio_resid;
+	sbappendstream(&so->so_snd, m, flags);
+	m = NULL;
 
-	if (addr != NULL && addr->sa_family != AF_VSOCK) {
-		error = EAFNOSUPPORT;
-		goto out;
-	}
+	pcb = so->so_pcb;
+	error = pcb->ops->send_message(pcb, VSOCK_DATA);
 
-	if (resid < 0) {
-		error = EINVAL;
-		goto out;
-	}
-
-	do {
-		SOCK_SENDBUF_LOCK(so);
-
-		if (pcb->peer_shutdown & VSOCK_SHUT_RCV) {
-			SOCK_SENDBUF_UNLOCK(so);
-			error = EPIPE;
-			goto out;
-		}
-
-		if (so->so_snd.sb_state & SBS_CANTSENDMORE) {
-			SOCK_SENDBUF_UNLOCK(so);
-			error = EPIPE;
-			goto out;
-		}
-
-		if (so->so_error) {
-			error = so->so_error;
-			so->so_error = 0;
-			SOCK_SENDBUF_UNLOCK(so);
-			goto out;
-		}
-
-		if ((so->so_state & SS_ISCONNECTED) == 0) {
-			if ((so->so_proto->pr_flags & PR_CONNREQUIRED)) {
-				SOCK_SENDBUF_UNLOCK(so);
-				error = ENOTCONN;
-				goto out;
-			}
-		}
-
-		writable = pcb->ops->check_writable(pcb, FALSE);
-
-		if (writable == 0) {
-			// XXX: should call check_writable(pcb, TRUE) from here too?
-			if (so->so_state & SS_NBIO) {
-				error = EWOULDBLOCK;
-				SOCK_SENDBUF_UNLOCK(so);
-				goto out;
-			} else {
-				writable = pcb->ops->check_writable(pcb, TRUE);
-				error = sbwait(so, SO_SND);
-				SOCK_SENDBUF_UNLOCK(so);
-				if (error)
-					break;
-
-				continue;
-			}
-		}
-
-		SOCK_SENDBUF_UNLOCK(so);
-
-		towrite = MIN(writable, VSOCK_MAX_MSG_SIZE);
-		towrite = MIN(towrite, resid);
-		top = m_uiotombuf(uio, M_WAITOK, towrite, 0, 0);
-
-		if (top == NULL) {
-			error = EFAULT;
-			goto out;
-		}
-
-		resid = uio->uio_resid;
-
-		error =  pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, VSOCK_DATA, top);
-		if (error) {
-			goto out;
-		}
-		top = NULL;
-
-	} while (resid);
-
-out:
-	if (top != NULL)
-		m_freem(top);
-	if (control != NULL)
-		m_freem(control);
-
-	SOCK_IO_SEND_UNLOCK(so);
 	return (error);
 }
 
@@ -726,7 +640,7 @@ vsock_shutdown(struct socket *so, enum shutdown_how how)
 		sorflush(so);
 	}
 
-	return (pcb->ops->send_message(pcb->transport, &pcb->local, &pcb->remote, op, NULL));
+	return (pcb->ops->send_message(pcb, op));
 }
 
 static int
