@@ -262,7 +262,7 @@ vtsock_attach(device_t dev)
 		goto fail;
 	}
 
-	sc->vtsock_rxq.vtsrx_sg = sglist_alloc(VTSOCK_BUFSZ / PAGE_SIZE + 1, M_NOWAIT);
+	sc->vtsock_rxq.vtsrx_sg = sglist_alloc(VTSOCK_MAX_MSG_SIZE / PAGE_SIZE + 1, M_NOWAIT);
 	if (sc->vtsock_rxq.vtsrx_sg == NULL) {
 		error = ENOMEM;
 		goto fail;
@@ -458,11 +458,11 @@ vtsock_populate_rxvq(struct vtsock_rxq *rxq)
 	error = 0;
 
 	for (nbufs = 0; !virtqueue_full(vq); nbufs++) {
-		m = m_get3(VTSOCK_BUFSZ, M_NOWAIT, MT_DATA, 0);
+		m = m_get3(VTSOCK_MAX_MSG_SIZE, M_NOWAIT, MT_DATA, 0);
 		if (m == NULL) {
 			return (ENOBUFS);
 		}
-		m->m_len = VTSOCK_BUFSZ;
+		m->m_len = VTSOCK_MAX_MSG_SIZE;
 		error = vtsock_enqueue_rxvq_mbuf(rxq, m);
 		if (error) {
 			return (error);
@@ -679,6 +679,10 @@ vtsock_send_internal(void *transport, struct vsock_addr *src, struct vsock_addr 
 
 	error = vtsock_output(m);
 
+	if (error) {
+		printf("vtsock_output returned error to send_internal :(\n");
+	}
+
 	if (!error && op == VSOCK_DATA) {
 		PRIVATE_LOCK(private);
 		private->tx_cnt += len;
@@ -892,12 +896,12 @@ again:
 	while ((m = virtqueue_dequeue(vq, &len)) != NULL) {
 		m->m_len = len;
 		vtsock_input(m);
-		m = m_get3(VTSOCK_BUFSZ, M_NOWAIT, MT_DATA, 0);
+		m = m_get3(VTSOCK_MAX_MSG_SIZE, M_NOWAIT, MT_DATA, 0);
 		if (m == NULL) {
 			printf("Cannot allocate new mbuf\n");
 			break;
 		}
-		m->m_len = VTSOCK_BUFSZ;
+		m->m_len = VTSOCK_MAX_MSG_SIZE;
 		error = vtsock_enqueue_rxvq_mbuf(rxq, m);
 		if (error) {
 			printf("virtqueue is out of space: %d\n", error);
@@ -1013,8 +1017,8 @@ vtsock_input_request(struct virtio_vtsock_hdr *hdr)
 	private->peer_fwd_cnt = hdr->fwd_cnt;
 	private->fwd_cnt = 0;
 
-	soisconnected(newso);
 	vsock_pcb_insert_connected(newpcb);
+	soisconnected(newso);
 
 	vtsock_send_control(&local, &remote, VIRTIO_VTSOCK_OP_RESPONSE, private);
 
@@ -1371,10 +1375,10 @@ vtsock_post_receive(struct vsock_pcb *pcb, uint32_t received)
 	PRIVATE_UNLOCK(private);
 
 	/*
-	* If the peer's view of our credit is below a threshold (VTSOCK_BUFSZ << 2 here)
+	* If the peer's view of our credit is below a threshold (VTSOCK_MAX_MSG_SIZE << 2 here)
 	* send a credit update proactively.
 	*/
-	if ((private->fwd_cnt - private->last_fwd_cnt + (VTSOCK_BUFSZ << 2) ) >= private->last_buf_alloc) {
+	if ((private->fwd_cnt - private->last_fwd_cnt + (VTSOCK_MAX_MSG_SIZE << 2) ) >= private->last_buf_alloc) {
 		vtsock_send_internal(private, &pcb->local, &pcb->remote, VSOCK_CREDIT_UPDATE, NULL);
 	}
 }
