@@ -57,6 +57,7 @@ struct vsock_pcb {
 	struct vsock_transport_ops 	*ops;
 	struct mtx			mtx;
 	struct epoch_context		epoch_ctx;
+	struct mtx			tx_mtx;
 
 	/* Transport private data */
 	void				*transport;

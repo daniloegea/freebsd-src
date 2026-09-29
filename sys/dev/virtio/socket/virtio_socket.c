@@ -696,37 +696,22 @@ static int
 vtsock_send(struct vsock_pcb *pcb, enum vsock_ops op)
 {
 	struct mbuf *m;
-	struct sockbuf *sb;
-	volatile uint32_t writable, towrite, sosnd_size;
+	uint32_t writable, towrite, sosnd_size;
 	int error = 0;
 
 	if (op != VSOCK_DATA)
 		return (vtsock_send_internal(pcb->transport, &pcb->local, &pcb->remote, op, NULL));
 
+	mtx_lock(&pcb->tx_mtx);
+
 	do {
 		writable = vtsock_check_writable(pcb, FALSE);
 
 		if (writable == 0) {
-			writable = vtsock_check_writable(pcb, TRUE);
-
-			SOCKBUF_LOCK(&pcb->so->so_snd);
-			sb = sobuf(pcb->so, SO_SND);
-			sb->sb_flags |= SB_WAIT;
-			/* Wait until we receive a credit update or check again in 100ms */
-			error = msleep_sbt(&sb->sb_acc, soeventmtx(pcb->so, SO_SND),
-				PSOCK | PCATCH, "sbwait", SBT_1MS * 100, 0, 0);
-			SOCKBUF_UNLOCK(&pcb->so->so_snd);
-
-			if (!(pcb->so->so_state & SS_ISCONNECTED))
-				goto out;
-
-			if (error == EWOULDBLOCK)
-				continue;
-
-			if (error)
-				goto out;
-
-			continue;
+			// If our peer doesn't have credits, send a credit request and return without doing anything
+			(void)vtsock_check_writable(pcb, TRUE);
+			mtx_unlock(&pcb->tx_mtx);
+			return (0);
 		}
 
 		SOCKBUF_LOCK(&pcb->so->so_snd);
@@ -738,16 +723,22 @@ vtsock_send(struct vsock_pcb *pcb, enum vsock_ops op)
 		if (towrite > 0) {
 			SOCKBUF_LOCK(&pcb->so->so_snd);
 			m = m_copym(pcb->so->so_snd.sb_mb, 0, towrite, M_NOWAIT);
-			sbdrop_locked(&pcb->so->so_snd, towrite);
 			SOCKBUF_UNLOCK(&pcb->so->so_snd);
 			error = vtsock_send_internal(pcb->transport, &pcb->local, &pcb->remote, VSOCK_DATA, m);
-			if (error)
+			// TODO: how to propagate this error up the stack?
+			// Need to handle the case when the data can't be added to the virtqueue
+			if (error) {
+				mtx_unlock(&pcb->tx_mtx);
 				return (error);
+			}
+
+			sbdrop(&pcb->so->so_snd, towrite);
 		}
 
 	} while(towrite > 0);
 
-out:
+	mtx_unlock(&pcb->tx_mtx);
+
 	return (error);
 }
 
@@ -1208,8 +1199,9 @@ vtsock_input_credit_update(struct virtio_vtsock_hdr *hdr)
 	private->peer_buf_alloc = hdr->buf_alloc;
 	PRIVATE_UNLOCK(private);
 
-	// Don't wake the sender thread up if the credit is still zero
+	// If our peer has credit now, try to send any data waiting in so_snd and wakeup the writers
 	if (vtsock_get_peer_credit(private) > 0) {
+		vtsock_send(pcb, VSOCK_DATA);
 		sowwakeup(pcb->so);
 	}
 
@@ -1305,6 +1297,9 @@ vtsock_input_data(struct mbuf *m, struct virtio_vtsock_hdr *hdr)
 	SOCK_RECVBUF_LOCK(so);
 
 	if (sbspace(&so->so_rcv) < m_len) {
+		/* This shouldn't happen. We must advertise our buf_alloc as being the size of so_rcv
+		 * so our peer will never send more data then we can store.
+		*/
 		SOCK_RECVBUF_UNLOCK(so);
 		goto out;
 	}
@@ -1441,7 +1436,7 @@ vtsock_attach_socket(struct vsock_pcb *pcb)
 	SOCK_RECVBUF_LOCK(pcb->so);
 	private->buf_alloc = pcb->so->so_rcv.sb_hiwat;
 	SOCK_RECVBUF_UNLOCK(pcb->so);
-	private->last_buf_alloc = VSOCK_RCV_BUFFER_SIZE;
+	private->last_buf_alloc = private->buf_alloc;
 
 	pcb->transport = private;
 	mtx_init(&private->mtx, "virtio_socket_data_mtx", NULL, MTX_DEF);

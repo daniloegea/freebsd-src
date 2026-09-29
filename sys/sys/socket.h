@@ -275,6 +275,7 @@ struct accept_filter_arg {
 #define AF_VSOCK	48		/* Virtio VSOCK */
 
 #define	AF_MAX		49
+
 /*
  * When allocating a new AF_ constant, please only allocate
  * even numbered constants for FreeBSD until 134 as odd numbered AF_

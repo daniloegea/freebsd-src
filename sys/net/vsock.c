@@ -496,6 +496,11 @@ vsock_send(struct socket *so, int flags, struct mbuf *m,
 	struct vsock_pcb *pcb;
 	int error = 0;
 
+	if (control != NULL) {
+		m_freem(control);
+		control = NULL;
+	}
+
 	if (m == NULL)
 		return (0);
 
@@ -676,6 +681,7 @@ vsock_pcballoc(void)
 	}
 
 	mtx_init(&pcb->mtx, "vsock PCB lock", NULL, MTX_DEF);
+	mtx_init(&pcb->tx_mtx, "vsock PCB TX lock", NULL, MTX_DEF);
 
 	return (pcb);
 }
@@ -684,6 +690,7 @@ static void
 vsock_pcbfree(struct vsock_pcb *pcb)
 {
 	mtx_destroy(&pcb->mtx);
+	mtx_destroy(&pcb->tx_mtx);
 	free(pcb, M_VSOCK);
 }
 
